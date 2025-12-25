@@ -1,0 +1,22 @@
+{
+  "name": "flowsense-mvp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+   "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "pg": "^8.16.3",
+    "twilio": "^5.11.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.11"
+  }
+}
