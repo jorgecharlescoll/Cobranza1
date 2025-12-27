@@ -121,23 +121,55 @@ if (parsed.intent === "add_debt") {
   const clientName = parsed.client_name || "Cliente";
   let amount = parsed.amount_due;
 
-// Post-proceso: entiende "2k", "2 mil", "2,5k", "1.2k"
-if (!amount) {
-  // Si OpenAI no dio número, intentamos extraer nosotros
-  const m = body.toLowerCase().match(/(\d+(?:[.,]\d+)?)\s*(k|mil)\b/);
-  if (m) {
-    const n = Number(m[1].replace(",", "."));
-    if (Number.isFinite(n)) amount = Math.round(n * 1000);
+  // Post-proceso: entiende "2k", "2 mil", "2,5k", "1.2k"
+  if (!amount) {
+    // Si OpenAI no dio número, intentamos extraer nosotros
+    const m = body.toLowerCase().match(/(\d+(?:[.,]\d+)?)\s*(k|mil)\b/);
+    if (m) {
+      const n = Number(m[1].replace(",", "."));
+      if (Number.isFinite(n)) amount = Math.round(n * 1000);
+    }
+  } else {
+    // Si dio un número pequeño y el texto trae k/mil, corrige
+    const hasK = /\b(k|mil)\b/i.test(body);
+    if (hasK && amount < 1000) amount = Math.round(amount * 1000);
   }
-} else {
-  // Si dio un número pequeño y el texto trae k/mil, corrige
-  const hasK = /\b(k|mil)\b/i.test(body);
-  if (hasK && amount < 1000) amount = Math.round(amount * 1000);
-}
 
-// Guardrail: si detectamos k/mil pero sigue quedando muy bajo, pide confirmación
-if (/\b(k|mil)\b/i.test(body) && amount && amount < 1000) {
-  twiml.message(`¿Te refieres a $${amount} o $${amount * 1000}? Responde: "${amount}" o "${amount}k"`);
+  // Guardrail: si detectamos k/mil pero sigue quedando muy bajo, pide confirmación
+  if (/\b(k|mil)\b/i.test(body) && amount && amount < 1000) {
+    twiml.message(
+      `¿Te refieres a $${amount} o $${amount * 1000}? ` +
+      `Responde: "${amount}" o "${amount}k".`
+    );
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  // Si aún no hay monto, no registramos nada y pedimos ejemplo
+  if (!amount) {
+    twiml.message(
+      `No pude identificar el monto. Ejemplo:\n` +
+      `• "Juan me debe 8500 desde el 3 de mayo"\n` +
+      `• "me deben 2k desde ayer"\n` +
+      `• "Pedro quedó a deber 300"`
+    );
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  const since = parsed.since_text || null;
+
+  const debt = await addDebt(user.id, clientName, amount, since);
+  const amt = Number(debt.amount_due).toLocaleString("es-MX", {
+    style: "currency",
+    currency: "MXN",
+  });
+
+  twiml.message(
+    `Registrado ✅\n` +
+    `• Cliente: ${debt.client_name}\n` +
+    `• Monto: ${amt}\n` +
+    (debt.due_text ? `• Desde: ${debt.due_text}\n\n` : `\n`) +
+    `¿Quieres agregar otro o me preguntas "¿Quién me debe?"`
+  );
   return res.type("text/xml").send(twiml.toString());
 }
 
