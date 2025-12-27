@@ -119,7 +119,28 @@ if (parsed.intent === "list_debts") {
 
 if (parsed.intent === "add_debt") {
   const clientName = parsed.client_name || "Cliente";
-  const amount = parsed.amount_due;
+  let amount = parsed.amount_due;
+
+// Post-proceso: entiende "2k", "2 mil", "2,5k", "1.2k"
+if (!amount) {
+  // Si OpenAI no dio número, intentamos extraer nosotros
+  const m = body.toLowerCase().match(/(\d+(?:[.,]\d+)?)\s*(k|mil)\b/);
+  if (m) {
+    const n = Number(m[1].replace(",", "."));
+    if (Number.isFinite(n)) amount = Math.round(n * 1000);
+  }
+} else {
+  // Si dio un número pequeño y el texto trae k/mil, corrige
+  const hasK = /\b(k|mil)\b/i.test(body);
+  if (hasK && amount < 1000) amount = Math.round(amount * 1000);
+}
+
+// Guardrail: si detectamos k/mil pero sigue quedando muy bajo, pide confirmación
+if (/\b(k|mil)\b/i.test(body) && amount && amount < 1000) {
+  twiml.message(`¿Te refieres a $${amount} o $${amount * 1000}? Responde: "${amount}" o "${amount}k"`);
+  return res.type("text/xml").send(twiml.toString());
+}
+
   const since = parsed.since_text || null;
 
   if (!amount) {
