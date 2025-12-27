@@ -4,12 +4,8 @@ const twilio = require("twilio");
 
 const { getOrCreateUser, updateUser, addDebt, listPendingDebts } = require("./db");
 
-const {
-  getOrCreateUser,
-  updateUser,
-  addDebt,
-  listPendingDebts,
-} = require("./db");
+
+}
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
