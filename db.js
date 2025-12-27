@@ -6,8 +6,12 @@ if (!connectionString) throw new Error("DATABASE_URL is not set");
 
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: false },
+  ssl: {
+    rejectUnauthorized: false,
+    require: true,
+  },
 });
+
 
 async function getOrCreateUser(phone) {
   const { rows } = await pool.query(
