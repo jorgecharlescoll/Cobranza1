@@ -2,6 +2,8 @@ require("dotenv").config();
 const express = require("express");
 const twilio = require("twilio");
 
+const { getOrCreateUser } = require("./db");
+
 const {
   getOrCreateUser,
   updateUser,
