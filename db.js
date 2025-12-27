@@ -1,15 +1,24 @@
 // db.js
+// db.js
 const { Pool } = require("pg");
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) throw new Error("DATABASE_URL is not set");
 
+// Fuerza SSL de forma explícita, sin depender del string
 const pool = new Pool({
   connectionString,
   ssl: {
     rejectUnauthorized: false,
     require: true,
   },
+  max: 5,
+  connectionTimeoutMillis: 10000,
+});
+
+// (opcional) timeout de queries
+pool.on("connect", (client) => {
+  client.query("SET statement_timeout = 15000").catch(() => {});
 });
 
 
