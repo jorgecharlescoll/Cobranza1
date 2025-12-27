@@ -3,7 +3,16 @@ require("dotenv").config();
 const express = require("express");
 const twilio = require("twilio");
 
-const { getOrCreateUser, addDebt, listPendingDebts } = require("./db");
+const {
+  getOrCreateUser,
+  addDebt,
+  listPendingDebts,
+  createReminder,
+  listDueReminders,
+  markReminderSent,
+  markReminderFailed,
+} = require("./db");
+
 const { parseMessage } = require("./ai");
 
 const app = express();
@@ -12,6 +21,62 @@ app.use(express.urlencoded({ extended: false }));
 const VERSION = "v-2025-12-27-FINAL";
 
 app.get("/health", (_, res) => res.send(`ok ${VERSION}`));
+
+function nextWeekdayDate(targetDow, hour = 10) {
+  const now = new Date();
+  const d = new Date(now);
+  d.setHours(hour, 0, 0, 0);
+  const current = d.getDay(); // 0=dom,1=lun,...6=sab
+  let add = (targetDow - current + 7) % 7;
+  if (add === 0 && d <= now) add = 7;
+  d.setDate(d.getDate() + add);
+  return d;
+}
+
+function parseWhen(text, defaultHour = 10) {
+  const t = (text || "").toLowerCase();
+
+  const now = new Date();
+  const base = new Date(now);
+
+  // mañana
+  if (t.includes("mañana")) {
+    base.setDate(base.getDate() + 1);
+    base.setHours(defaultHour, 0, 0, 0);
+    return base;
+  }
+
+  // hoy
+  if (t.includes("hoy")) {
+    base.setHours(defaultHour, 0, 0, 0);
+    if (base <= now) base.setHours(now.getHours() + 1, 0, 0, 0);
+    return base;
+  }
+
+  // en N dias
+  const m = t.match(/en\s+(\d+)\s+d[ií]as?/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    base.setDate(base.getDate() + (Number.isFinite(n) ? n : 1));
+    base.setHours(defaultHour, 0, 0, 0);
+    return base;
+  }
+
+  // viernes / lunes / etc
+  if (t.includes("lunes")) return nextWeekdayDate(1, defaultHour);
+  if (t.includes("martes")) return nextWeekdayDate(2, defaultHour);
+  if (t.includes("miércoles") || t.includes("miercoles")) return nextWeekdayDate(3, defaultHour);
+  if (t.includes("jueves")) return nextWeekdayDate(4, defaultHour);
+  if (t.includes("viernes")) return nextWeekdayDate(5, defaultHour);
+  if (t.includes("sábado") || t.includes("sabado")) return nextWeekdayDate(6, defaultHour);
+  if (t.includes("domingo")) return nextWeekdayDate(0, defaultHour);
+
+  // si no entiende, por defecto: en 2 horas
+  const fallback = new Date(now);
+  fallback.setHours(now.getHours() + 2, 0, 0, 0);
+  return fallback;
+}
+
 
 app.post("/webhook/whatsapp", async (req, res) => {
   const from = req.body.From;
@@ -161,6 +226,45 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+
+if (parsed.intent === "remind") {
+  const defaultHour = Number(process.env.DEFAULT_REMIND_HOUR || 10);
+
+  // ¿a quién? MVP: te recordamos a TI (al mismo WhatsApp que escribió)
+  const toPhone = from;
+
+  // qué cliente (si lo detectó)
+  const clientName = parsed.client_name || null;
+
+  // cuándo
+  const whenText = parsed.remind_when_text || body;
+  const remindAt = parseWhen(whenText, defaultHour);
+
+  // mensaje que se enviará
+  const msg =
+    clientName
+      ? `👋 Recordatorio: cobrarle a ${clientName}.`
+      : `👋 Recordatorio: revisar tus cobros pendientes.`;
+
+  const r = await createReminder({
+    userId: user.id,
+    toPhone,
+    clientName,
+    amountDue: null,
+    remindAt,
+    message: msg,
+  });
+
+  twiml.message(
+    `⏰ Listo. Te lo recordaré ` +
+      `el ${r.remind_at ? new Date(r.remind_at).toLocaleString("es-MX") : "pronto"}.\n` +
+      (clientName ? `• Cliente: ${clientName}` : "")
+  );
+  return res.type("text/xml").send(twiml.toString());
+}
+
+
+
     // =========================
     // 6) AYUDA
     // =========================
@@ -191,6 +295,48 @@ app.post("/webhook/whatsapp", async (req, res) => {
     return res.type("text/xml").send(twiml.toString());
   }
 });
+
+app.get("/cron/reminders", async (req, res) => {
+  try {
+    if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
+      return res.status(401).send("unauthorized");
+    }
+
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const authToken = process.env.TWILIO_AUTH_TOKEN;
+    const fromWa = process.env.TWILIO_WHATSAPP_FROM;
+
+    if (!accountSid || !authToken || !fromWa) {
+      return res.status(500).send("missing twilio env");
+    }
+
+    const client = twilio(accountSid, authToken);
+
+    const due = await listDueReminders(50);
+    let sent = 0;
+
+    for (const r of due) {
+      try {
+        await client.messages.create({
+          from: fromWa,
+          to: r.to_phone,
+          body: r.message,
+        });
+        await markReminderSent(r.id);
+        sent++;
+      } catch (e) {
+        console.error("Send reminder failed:", r.id, e?.message || e);
+        await markReminderFailed(r.id);
+      }
+    }
+
+    return res.send(`ok sent=${sent} due=${due.length}`);
+  } catch (err) {
+    console.error("Cron error:", err);
+    return res.status(500).send("error");
+  }
+});
+
 
 const port = process.env.PORT || 3000;
 app.listen(port, () =>

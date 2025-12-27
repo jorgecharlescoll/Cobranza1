@@ -89,10 +89,57 @@ async function listPendingDebts(userId) {
   return rows;
 }
 
+async function createReminder({ userId, toPhone, clientName, amountDue, remindAt, message }) {
+  const { rows } = await pool.query(
+    `insert into public.reminders (user_id, to_phone, client_name, amount_due, remind_at, message)
+     values ($1, $2, $3, $4, $5, $6)
+     returning *`,
+    [userId, toPhone, clientName || null, amountDue || null, remindAt, message]
+  );
+  return rows[0];
+}
+
+async function listDueReminders(limit = 50) {
+  const { rows } = await pool.query(
+    `select *
+     from public.reminders
+     where status = 'pending'
+       and remind_at <= now()
+     order by remind_at asc
+     limit $1`,
+    [limit]
+  );
+  return rows;
+}
+
+async function markReminderSent(id) {
+  await pool.query(
+    `update public.reminders
+     set status = 'sent', sent_at = now()
+     where id = $1`,
+    [id]
+  );
+}
+
+async function markReminderFailed(id) {
+  await pool.query(
+    `update public.reminders
+     set status = 'failed'
+     where id = $1`,
+    [id]
+  );
+}
+
+
 module.exports = {
   pool,
   getOrCreateUser,
   updateUser,
   addDebt,
   listPendingDebts,
+  createReminder,
+  listDueReminders,
+  markReminderSent,
+  markReminderFailed,
+
 };
