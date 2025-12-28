@@ -143,7 +143,6 @@ async function sendWhatsApp(to, body) {
     to: normalizedTo,
     body,
   });
-}
 
 async function logSent(userId, debtIds) {
   if (!debtIds.length) return;
