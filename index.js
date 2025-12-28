@@ -5,6 +5,7 @@ const twilio = require("twilio");
 
 const {
   getOrCreateUser,
+  updateUser, // ✅ FIX: faltaba importarlo
   addDebt,
   listPendingDebts,
   createReminder,
@@ -65,10 +66,12 @@ function parseWhen(text, defaultHour = 10) {
   // viernes / lunes / etc
   if (t.includes("lunes")) return nextWeekdayDate(1, defaultHour);
   if (t.includes("martes")) return nextWeekdayDate(2, defaultHour);
-  if (t.includes("miércoles") || t.includes("miercoles")) return nextWeekdayDate(3, defaultHour);
+  if (t.includes("miércoles") || t.includes("miercoles"))
+    return nextWeekdayDate(3, defaultHour);
   if (t.includes("jueves")) return nextWeekdayDate(4, defaultHour);
   if (t.includes("viernes")) return nextWeekdayDate(5, defaultHour);
-  if (t.includes("sábado") || t.includes("sabado")) return nextWeekdayDate(6, defaultHour);
+  if (t.includes("sábado") || t.includes("sabado"))
+    return nextWeekdayDate(6, defaultHour);
   if (t.includes("domingo")) return nextWeekdayDate(0, defaultHour);
 
   // si no entiende, por defecto: en 2 horas
@@ -78,7 +81,12 @@ function parseWhen(text, defaultHour = 10) {
 }
 
 function buildReminderText({ clientName, amount, tone }) {
-  const amtTxt = amount ? ` por ${Number(amount).toLocaleString("es-MX", { style: "currency", currency: "MXN" })}` : "";
+  const amtTxt = amount
+    ? ` por ${Number(amount).toLocaleString("es-MX", {
+        style: "currency",
+        currency: "MXN",
+      })}`
+    : "";
   const name = clientName || "tu cliente";
 
   if (tone === "amable") {
@@ -90,8 +98,6 @@ function buildReminderText({ clientName, amount, tone }) {
   // urgente
   return `Hola ${name}. Seguimos pendientes con el pago${amtTxt}. Necesito que hoy me confirmes si podrás liquidarlo o acordar una fecha exacta.`;
 }
-
-
 
 function estimateDays(dueText) {
   if (!dueText) return 0;
@@ -129,69 +135,70 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const phone = from || "whatsapp:unknown";
     const user = await getOrCreateUser(phone);
 
-// =========================
-// C) FLUJO DE RECORDATORIO GUIADO (estado)
-// =========================
-if (user.pending_action === "remind_choose_tone") {
-  const tone = body.trim().toLowerCase();
-  const allowed = ["amable", "firme", "urgente", "cancelar"];
+    // =========================
+    // C) FLUJO DE RECORDATORIO GUIADO (estado)
+    // =========================
+    if (user.pending_action === "remind_choose_tone") {
+      const tone = body.trim().toLowerCase();
+      const allowed = ["amable", "firme", "urgente", "cancelar"];
 
-  if (!allowed.includes(tone)) {
-    twiml.message(`Elige un tono: amable / firme / urgente (o escribe "cancelar")`);
-    return res.type("text/xml").send(twiml.toString());
-  }
+      if (!allowed.includes(tone)) {
+        twiml.message(
+          `Elige un tono: amable / firme / urgente (o escribe "cancelar")`
+        );
+        return res.type("text/xml").send(twiml.toString());
+      }
 
-  if (tone === "cancelar") {
-    await updateUser(phone, { pending_action: null, pending_payload: null });
-    twiml.message("Cancelado ✅");
-    return res.type("text/xml").send(twiml.toString());
-  }
+      if (tone === "cancelar") {
+        await updateUser(phone, { pending_action: null, pending_payload: null });
+        twiml.message("Cancelado ✅");
+        return res.type("text/xml").send(twiml.toString());
+      }
 
-  const payload = user.pending_payload || {};
-  const clientName = payload.clientName || null;
-  const amount = payload.amount || null;
+      const payload = user.pending_payload || {};
+      const clientName = payload.clientName || null;
+      const amount = payload.amount || null;
 
-  const preview = buildReminderText({ clientName, amount, tone });
+      const preview = buildReminderText({ clientName, amount, tone });
 
-  await updateUser(phone, {
-    pending_action: "remind_confirm_send",
-    pending_payload: { ...payload, tone, preview },
-  });
+      await updateUser(phone, {
+        pending_action: "remind_confirm_send",
+        pending_payload: { ...payload, tone, preview },
+      });
 
-  twiml.message(
-    `📩 *Mensaje sugerido (${tone})*\n\n${preview}\n\n¿Lo envío ahora?\nResponde: "sí" o "cancelar"`
-  );
-  return res.type("text/xml").send(twiml.toString());
-}
+      twiml.message(
+        `📩 *Mensaje sugerido (${tone})*\n\n${preview}\n\n¿Lo envío ahora?\nResponde: "sí" o "cancelar"`
+      );
+      return res.type("text/xml").send(twiml.toString());
+    }
 
-if (user.pending_action === "remind_confirm_send") {
-  const ans = body.trim().toLowerCase();
-  if (ans !== "sí" && ans !== "si" && ans !== "cancelar") {
-    twiml.message(`Responde "sí" para enviar o "cancelar" para abortar.`);
-    return res.type("text/xml").send(twiml.toString());
-  }
+    if (user.pending_action === "remind_confirm_send") {
+      const ans = body.trim().toLowerCase();
+      if (ans !== "sí" && ans !== "si" && ans !== "cancelar") {
+        twiml.message(`Responde "sí" para enviar o "cancelar" para abortar.`);
+        return res.type("text/xml").send(twiml.toString());
+      }
 
-  if (ans === "cancelar") {
-    await updateUser(phone, { pending_action: null, pending_payload: null });
-    twiml.message("Cancelado ✅");
-    return res.type("text/xml").send(twiml.toString());
-  }
+      if (ans === "cancelar") {
+        await updateUser(phone, { pending_action: null, pending_payload: null });
+        twiml.message("Cancelado ✅");
+        return res.type("text/xml").send(twiml.toString());
+      }
 
-  const payload = user.pending_payload || {};
-  const clientName = payload.clientName || null;
-  const preview = payload.preview || null;
+      const payload = user.pending_payload || {};
+      const clientName = payload.clientName || null;
+      const preview = payload.preview || null;
 
-  // MVP seguro: enviamos el recordatorio a TI MISMO (tu número), no al cliente final.
-  // Esto evita temas de plantillas/opt-in y te permite copiar/pegar si quieres.
-  // Luego lo evolucionamos para enviar al cliente real con número guardado.
-  await updateUser(phone, { pending_action: null, pending_payload: null });
+      // MVP seguro: devolvemos el texto para que el usuario lo copie y pegue
+      await updateUser(phone, { pending_action: null, pending_payload: null });
 
-  twiml.message(
-    `✅ Listo. Aquí tienes el mensaje para enviar a *${clientName || "tu cliente"}*:\n\n${preview}`
-  );
-  return res.type("text/xml").send(twiml.toString());
-}
-
+      twiml.message(
+        `✅ Listo. Aquí tienes el mensaje para enviar a *${
+          clientName || "tu cliente"
+        }*:\n\n${preview}`
+      );
+      return res.type("text/xml").send(twiml.toString());
+    }
 
     // =========================
     // 1) REGLAS DIRECTAS
@@ -314,15 +321,14 @@ if (user.pending_action === "remind_confirm_send") {
       }
 
       const ranked = debts
-  .map((d) => {
-    const days = estimateDays(d.due_text);
-    const score = Number(d.amount_due || 0) + days * 10; // factor simple
-    return { ...d, score, days };
-  })
-  .sort((a, b) => b.score - a.score);
+        .map((d) => {
+          const days = estimateDays(d.due_text);
+          const score = Number(d.amount_due || 0) + days * 10; // factor simple
+          return { ...d, score, days };
+        })
+        .sort((a, b) => b.score - a.score);
 
-const top = ranked[0];
-
+      const top = ranked[0];
 
       const amt = Number(top.amount_due || 0).toLocaleString("es-MX", {
         style: "currency",
@@ -330,37 +336,36 @@ const top = ranked[0];
       });
 
       twiml.message(
-  `📌 *Recomendación de cobranza*\n\n` +
-    `Cobra primero a *${top.client_name}* por *${amt}*` +
-    (top.due_text ? ` (desde ${top.due_text})` : "") +
-    `.\n` +
-    (top.days ? `Prioridad por atraso estimado: ~${top.days} días.` : "")
-);
+        `📌 *Recomendación de cobranza*\n\n` +
+          `Cobra primero a *${top.client_name}* por *${amt}*` +
+          (top.due_text ? ` (desde ${top.due_text})` : "") +
+          `.\n` +
+          (top.days ? `Prioridad por atraso estimado: ~${top.days} días.` : "")
+      );
 
-return res.type("text/xml").send(twiml.toString());
-
+      return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
+    // C) INICIAR RECORDATORIO GUIADO
+    // =========================
+    if (parsed.intent === "remind") {
+      const clientName = parsed.client_name || null;
+      const amount = parsed.amount_due || null;
 
-if (parsed.intent === "remind") {
-  // Guardamos el cliente detectado y (si existe) el monto
-  const clientName = parsed.client_name || null;
-  const amount = parsed.amount_due || null;
+      await updateUser(phone, {
+        pending_action: "remind_choose_tone",
+        pending_payload: { clientName, amount },
+      });
 
-  await updateUser(phone, {
-    pending_action: "remind_choose_tone",
-    pending_payload: { clientName, amount },
-  });
-
-  twiml.message(
-    `¿Qué tono quieres para el recordatorio${clientName ? ` a *${clientName}*` : ""}?\n` +
-      `• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
-  );
-  return res.type("text/xml").send(twiml.toString());
-}
-
-
-
+      twiml.message(
+        `¿Qué tono quieres para el recordatorio${
+          clientName ? ` a *${clientName}*` : ""
+        }?\n` +
+          `• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
+      );
+      return res.type("text/xml").send(twiml.toString());
+    }
 
     // =========================
     // 6) AYUDA
@@ -434,8 +439,5 @@ app.get("/cron/reminders", async (req, res) => {
   }
 });
 
-
 const port = process.env.PORT || 3000;
-app.listen(port, () =>
-  console.log("Server running on port", port, "—", VERSION)
-);
+app.listen(port, () => console.log("Server running on port", port, "—", VERSION));
