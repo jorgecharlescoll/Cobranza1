@@ -5,7 +5,7 @@ const twilio = require("twilio");
 
 const {
   getOrCreateUser,
-  updateUser, // ✅ FIX: faltaba importarlo
+  updateUser,
   addDebt,
   listPendingDebts,
   createReminder,
@@ -38,25 +38,21 @@ function nextWeekdayDate(targetDow, hour = 10) {
 
 function parseWhen(text, defaultHour = 10) {
   const t = (text || "").toLowerCase();
-
   const now = new Date();
   const base = new Date(now);
 
-  // mañana
   if (t.includes("mañana")) {
     base.setDate(base.getDate() + 1);
     base.setHours(defaultHour, 0, 0, 0);
     return base;
   }
 
-  // hoy
   if (t.includes("hoy")) {
     base.setHours(defaultHour, 0, 0, 0);
     if (base <= now) base.setHours(now.getHours() + 1, 0, 0, 0);
     return base;
   }
 
-  // en N dias
   const m = t.match(/en\s+(\d+)\s+d[ií]as?/);
   if (m) {
     const n = parseInt(m[1], 10);
@@ -65,7 +61,6 @@ function parseWhen(text, defaultHour = 10) {
     return base;
   }
 
-  // viernes / lunes / etc
   if (t.includes("lunes")) return nextWeekdayDate(1, defaultHour);
   if (t.includes("martes")) return nextWeekdayDate(2, defaultHour);
   if (t.includes("miércoles") || t.includes("miercoles"))
@@ -76,7 +71,6 @@ function parseWhen(text, defaultHour = 10) {
     return nextWeekdayDate(6, defaultHour);
   if (t.includes("domingo")) return nextWeekdayDate(0, defaultHour);
 
-  // si no entiende, por defecto: en 2 horas
   const fallback = new Date(now);
   fallback.setHours(now.getHours() + 2, 0, 0, 0);
   return fallback;
@@ -97,7 +91,6 @@ function buildReminderText({ clientName, amount, tone }) {
   if (tone === "firme") {
     return `Hola ${name}. Te escribo para dar seguimiento al pago pendiente${amtTxt}. ¿Podrías confirmarme cuándo lo liquidarás?`;
   }
-  // urgente
   return `Hola ${name}. Seguimos pendientes con el pago${amtTxt}. Necesito que hoy me confirmes si podrás liquidarlo o acordar una fecha exacta.`;
 }
 
@@ -105,12 +98,10 @@ function estimateDays(dueText) {
   if (!dueText) return 0;
   const t = String(dueText).toLowerCase();
 
-  // heurística simple (MVP)
   if (t.includes("año")) return 365;
   if (t.includes("mes")) return 30;
   if (t.includes("semana")) return 7;
 
-  // si trae un número: "hace 6 meses", "2 semanas", "3 meses"
   const m = t.match(/(\d+)\s*(año|anos|años|mes|meses|semana|semanas)/);
   if (m) {
     const n = parseInt(m[1], 10);
@@ -121,6 +112,12 @@ function estimateDays(dueText) {
     if (unit.startsWith("sem")) return n * 7;
   }
 
+  return 0;
+}
+
+// =========================
+// Helpers WhatsApp
+// =========================
 function normalizeWhatsAppTo(input) {
   if (!input) return null;
   let s = String(input).trim();
@@ -131,14 +128,10 @@ function normalizeWhatsAppTo(input) {
   // si empieza con 52... sin +, lo agregamos
   if (/^52\d+/.test(s)) s = "+" + s;
 
-  // si no empieza con +, intentamos agregarlo (último recurso)
+  // si no empieza con +, intentamos agregarlo
   if (!s.startsWith("+")) s = "+" + s;
 
   return `whatsapp:${s}`;
-}
-
-  // fallback
-  return 0;
 }
 
 app.post("/webhook/whatsapp", async (req, res) => {
@@ -149,21 +142,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
   try {
     console.log("Incoming:", { from, body });
 
-    // Identificar usuario por teléfono
     const phone = from || "whatsapp:unknown";
     const user = await getOrCreateUser(phone);
 
     // =========================
-    // C) FLUJO DE RECORDATORIO GUIADO (estado)
+    // ESTADOS: recordatorio guiado
     // =========================
     if (user.pending_action === "remind_choose_tone") {
       const tone = body.trim().toLowerCase();
       const allowed = ["amable", "firme", "urgente", "cancelar"];
 
       if (!allowed.includes(tone)) {
-        twiml.message(
-          `Elige un tono: amable / firme / urgente (o escribe "cancelar")`
-        );
+        twiml.message(`Elige un tono: amable / firme / urgente (o "cancelar")`);
         return res.type("text/xml").send(twiml.toString());
       }
 
@@ -173,40 +163,17 @@ app.post("/webhook/whatsapp", async (req, res) => {
         return res.type("text/xml").send(twiml.toString());
       }
 
-     const payload = user.pending_payload || {};
-const clientName = payload.clientName || null;
-const preview = payload.preview || null;
-const toPhone = payload.toPhone || null;
+      const payload = user.pending_payload || {};
+      const clientName = payload.clientName || null;
+      const amount = payload.amount || null;
+      const toPhone = payload.toPhone || null;
 
-if (!toPhone) {
-  await updateUser(phone, { pending_action: null, pending_payload: null });
-  twiml.message(`✅ Listo. Aquí tienes el mensaje para enviar a *${clientName || "tu cliente"}*:\n\n${preview}`);
-  return res.type("text/xml").send(twiml.toString());
-}
+      const preview = buildReminderText({ clientName, amount, tone });
 
-// ✅ ENVÍO AUTOMÁTICO
-const accountSid = process.env.TWILIO_ACCOUNT_SID;
-const authToken = process.env.TWILIO_AUTH_TOKEN;
-const fromWa = process.env.TWILIO_WHATSAPP_FROM;
-
-if (!accountSid || !authToken || !fromWa) {
-  throw new Error("Missing Twilio env vars (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_WHATSAPP_FROM)");
-}
-
-const twilioClient = twilio(accountSid, authToken);
-
-// Confirmación extra explícita (ya dijiste “sí”, pero damos claridad en logs)
-await twilioClient.messages.create({
-  from: fromWa,
-  to: toPhone,
-  body: preview,
-});
-
-await updateUser(phone, { pending_action: null, pending_payload: null });
-
-twiml.message(`✅ Enviado a *${clientName}* (${toPhone}).`);
-return res.type("text/xml").send(twiml.toString());
-
+      await updateUser(phone, {
+        pending_action: "remind_confirm_send",
+        pending_payload: { clientName, amount, tone, preview, toPhone },
+      });
 
       twiml.message(
         `📩 *Mensaje sugerido (${tone})*\n\n${preview}\n\n¿Lo envío ahora?\nResponde: "sí" o "cancelar"`
@@ -229,16 +196,42 @@ return res.type("text/xml").send(twiml.toString());
 
       const payload = user.pending_payload || {};
       const clientName = payload.clientName || null;
-      const preview = payload.preview || null;
+      const preview = payload.preview || "";
+      const toPhone = payload.toPhone || null;
 
-      // MVP seguro: devolvemos el texto para que el usuario lo copie y pegue
+      // Si no hay teléfono guardado → copy/paste
+      if (!toPhone) {
+        await updateUser(phone, { pending_action: null, pending_payload: null });
+        twiml.message(
+          `✅ Listo. Aquí tienes el mensaje para enviar a *${
+            clientName || "tu cliente"
+          }*:\n\n${preview}`
+        );
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      // Envío automático
+      const accountSid = process.env.TWILIO_ACCOUNT_SID;
+      const authToken = process.env.TWILIO_AUTH_TOKEN;
+      const fromWa = process.env.TWILIO_WHATSAPP_FROM;
+
+      if (!accountSid || !authToken || !fromWa) {
+        throw new Error(
+          "Missing Twilio env vars (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_WHATSAPP_FROM)"
+        );
+      }
+
+      const twilioClient = twilio(accountSid, authToken);
+
+      await twilioClient.messages.create({
+        from: fromWa,
+        to: toPhone,
+        body: preview,
+      });
+
       await updateUser(phone, { pending_action: null, pending_payload: null });
 
-      twiml.message(
-        `✅ Listo. Aquí tienes el mensaje para enviar a *${
-          clientName || "tu cliente"
-        }*:\n\n${preview}`
-      );
+      twiml.message(`✅ Enviado a *${clientName || "tu cliente"}* (${toPhone}).`);
       return res.type("text/xml").send(twiml.toString());
     }
 
@@ -266,28 +259,32 @@ return res.type("text/xml").send(twiml.toString());
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
+    // C1) GUARDAR TELÉFONO DE CLIENTE
+    // Ej: "Guarda teléfono de Juan +5218331112222"
+    // =========================
+    const mSave = body.match(
+      /guarda(?:r)?\s+(?:el\s+)?tel(?:e|é)fono\s+de\s+(.+?)\s+(\+?\d[\d\s-]{7,})$/i
+    );
+    if (mSave) {
+      const clientName = mSave[1].trim();
+      const rawPhone = mSave[2].trim();
+      const wa = normalizeWhatsAppTo(rawPhone);
 
-// =========================
-// C1) GUARDAR TELÉFONO DE CLIENTE (regla directa)
-// Ej: "Guarda teléfono de Juan +5218331112222"
-// =========================
-const mSave = body.match(/guarda(?:r)?\s+(?:el\s+)?tel(?:e|é)fono\s+de\s+(.+?)\s+(\+?\d[\d\s-]{7,})$/i);
-if (mSave) {
-  const clientName = mSave[1].trim();
-  const rawPhone = mSave[2].trim();
-  const wa = normalizeWhatsAppTo(rawPhone);
+      const client = await findClientByName(user.id, clientName);
+      if (!client) {
+        twiml.message(
+          `No encontré al cliente "${clientName}". Primero registra una deuda, por ejemplo: "${clientName} me debe 500".`
+        );
+        return res.type("text/xml").send(twiml.toString());
+      }
 
-  const client = await findClientByName(user.id, clientName);
-  if (!client) {
-    twiml.message(`No encontré al cliente "${clientName}". Primero registra una deuda, por ejemplo: "${clientName} me debe 500".`);
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  const updated = await setClientPhone(user.id, clientName, wa);
-  twiml.message(`✅ Listo. Guardé el WhatsApp de *${updated.name}* como:\n${updated.phone}\n\nAhora puedes: "Manda recordatorio a ${updated.name}"`);
-  return res.type("text/xml").send(twiml.toString());
-}
-
+      const updated = await setClientPhone(user.id, clientName, wa);
+      twiml.message(
+        `✅ Listo. Guardé el WhatsApp de *${updated.name}* como:\n${updated.phone}\n\nAhora puedes: "Manda recordatorio a ${updated.name}"`
+      );
+      return res.type("text/xml").send(twiml.toString());
+    }
 
     // =========================
     // 2) OPENAI PARSER
@@ -337,11 +334,9 @@ if (mSave) {
         if (hasK && amount < 1000) amount = Math.round(amount * 1000);
       }
 
-      // Confirmación si aún es ambiguo
       if (/\b(k|mil)\b/i.test(body) && amount && amount < 1000) {
         twiml.message(
-          `¿Te refieres a $${amount} o $${amount * 1000}? ` +
-            `Responde "${amount}" o "${amount}k".`
+          `¿Te refieres a $${amount} o $${amount * 1000}? Responde "${amount}" o "${amount}k".`
         );
         return res.type("text/xml").send(twiml.toString());
       }
@@ -388,7 +383,7 @@ if (mSave) {
       const ranked = debts
         .map((d) => {
           const days = estimateDays(d.due_text);
-          const score = Number(d.amount_due || 0) + days * 10; // factor simple
+          const score = Number(d.amount_due || 0) + days * 10;
           return { ...d, score, days };
         })
         .sort((a, b) => b.score - a.score);
@@ -415,27 +410,27 @@ if (mSave) {
     // C) INICIAR RECORDATORIO GUIADO
     // =========================
     if (parsed.intent === "remind") {
-  const clientName = parsed.client_name || null;
-  const amount = parsed.amount_due || null;
+      const clientName = parsed.client_name || null;
+      const amount = parsed.amount_due || null;
 
-  let toPhone = null;
-  if (clientName) {
-    const client = await findClientByName(user.id, clientName);
-    if (client?.phone) toPhone = client.phone;
-  }
+      let toPhone = null;
+      if (clientName) {
+        const client = await findClientByName(user.id, clientName);
+        if (client?.phone) toPhone = client.phone;
+      }
 
-  await updateUser(phone, {
-    pending_action: "remind_choose_tone",
-    pending_payload: { clientName, amount, toPhone },
-  });
+      await updateUser(phone, {
+        pending_action: "remind_choose_tone",
+        pending_payload: { clientName, amount, toPhone },
+      });
 
-  twiml.message(
-    `¿Qué tono quieres para el recordatorio${clientName ? ` a *${clientName}*` : ""}?\n` +
-      `• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
-  );
-  return res.type("text/xml").send(twiml.toString());
-}
-
+      twiml.message(
+        `¿Qué tono quieres para el recordatorio${
+          clientName ? ` a *${clientName}*` : ""
+        }?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
+      );
+      return res.type("text/xml").send(twiml.toString());
+    }
 
     // =========================
     // 6) AYUDA
@@ -446,7 +441,8 @@ if (mSave) {
           `1) "Juan me debe 8500 desde el 3 de mayo"\n` +
           `2) "¿Quién me debe?"\n` +
           `3) "¿A quién cobro primero?"\n` +
-          `\nTambién entiendo: "me deben 2k".`
+          `\nTambién entiendo: "me deben 2k".\n` +
+          `Y para guardar teléfono: "Guarda teléfono de Juan +5218..."`
       );
       return res.type("text/xml").send(twiml.toString());
     }
@@ -458,7 +454,9 @@ if (mSave) {
       `Te leo. Prueba:\n` +
         `• "Juan me debe 8500 desde el 3 de mayo"\n` +
         `• "¿Quién me debe?"\n` +
-        `• "¿A quién cobro primero?"`
+        `• "¿A quién cobro primero?"\n` +
+        `• "Guarda teléfono de Juan +5218..."\n` +
+        `• "Manda recordatorio a Juan"`
     );
     return res.type("text/xml").send(twiml.toString());
   } catch (err) {
@@ -510,4 +508,6 @@ app.get("/cron/reminders", async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server running on port", port, "—", VERSION));
+app.listen(port, () =>
+  console.log("Server running on port", port, "—", VERSION)
+);
