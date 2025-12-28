@@ -7,12 +7,16 @@ if (!connectionString) throw new Error("DATABASE_URL is not set");
 // Pool estable para Render + Supabase pooler
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: false }, // necesario en muchos despliegues
+  ssl: {
+    rejectUnauthorized: false,
+    checkServerIdentity: () => undefined,
+  },
   max: 5,
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 30000,
   keepAlive: true,
 });
+
 
 // Logs útiles si se cae el pool
 pool.on("error", (err) => {
