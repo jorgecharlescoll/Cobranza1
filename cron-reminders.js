@@ -21,6 +21,10 @@ const DEFAULT_COOLDOWN_HOURS = Number(process.env.REMINDER_COOLDOWN_HOURS || 20)
 // Cuántas deudas máximo incluir en el mensaje
 const MAX_ITEMS = Number(process.env.REMINDER_MAX_ITEMS || 5);
 
+// Oculta montos muy pequeños en el resumen (solo UX, no borra datos)
+const MIN_AMOUNT_TO_SHOW = Number(process.env.REMINDER_MIN_AMOUNT || 50);
+
+
 function fmtMoney(n) {
   try {
     return new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" }).format(Number(n || 0));
@@ -88,16 +92,46 @@ async function pickDebtsToRemind() {
 }
 
 function buildMessageForUser(items) {
-  // Orden simple: primero las más antiguas (ya vienen así), tomamos MAX_ITEMS
-  const top = items.slice(0, MAX_ITEMS);
+  // 1) Filtra por monto para que el resumen se vea profesional
+  const filtered = items.filter((it) => Number(it.amount_due || 0) >= MIN_AMOUNT_TO_SHOW);
+
+  // Si al filtrar se queda vacío, usamos los primeros (para no mandar un mensaje “sin contenido”)
+  const baseList = filtered.length ? filtered : items;
+
+  // 2) Tomamos MAX_ITEMS de la lista base
+  const top = baseList.slice(0, MAX_ITEMS);
+
+  // 3) Total recuperable (de lo que mostramos)
+  const total = top.reduce((sum, it) => sum + Number(it.amount_due || 0), 0);
 
   let msg = `📌 *Recordatorio de cobranza (hoy)*\n\n`;
   msg += `Tengo estas deudas pendientes que conviene revisar:\n`;
 
   for (const it of top) {
+    const name =
+      it.client_name && it.client_name.trim() && it.client_name !== "Cliente"
+        ? it.client_name
+        : "Cliente (sin nombre)";
+
     const since = it.due_text ? ` (desde: ${it.due_text})` : "";
-    msg += `• *${it.client_name}*: ${fmtMoney(it.amount_due)}${since}\n`;
+    msg += `• *${name}*: ${fmtMoney(it.amount_due)}${since}\n`;
   }
+
+  // Conteo “más pendientes” basado en la lista que usamos (baseList)
+  if (baseList.length > top.length) {
+    msg += `\n(+${baseList.length - top.length} más pendientes)\n`;
+  }
+
+  msg += `\n💰 *Total recuperable hoy (de este resumen):* ${fmtMoney(total)}\n`;
+
+  msg += `\nResponde aquí con uno de estos:\n`;
+  msg += `• "¿A quién cobro primero?"\n`;
+  msg += `• "Manda recordatorio a {Nombre}"\n`;
+  msg += `• "¿Quién me debe?"\n`;
+
+  return msg;
+}
+
 
   if (items.length > top.length) {
     msg += `\n(+${items.length - top.length} más pendientes)\n`;
