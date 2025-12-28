@@ -11,11 +11,21 @@ const pool = new Pool({
     rejectUnauthorized: false,
     checkServerIdentity: () => undefined,
   },
+
+  // estabilidad
   max: 5,
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 15000,
   idleTimeoutMillis: 30000,
   keepAlive: true,
+
+  // ✅ fuerza IPv4 (clave en Render cuando hay timeouts raros)
+  family: 4,
 });
+
+pool.on("error", (err) => {
+  console.error("PG pool error:", err);
+});
+
 
 
 // Logs útiles si se cae el pool
