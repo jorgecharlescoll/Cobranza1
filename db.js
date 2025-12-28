@@ -130,6 +130,28 @@ async function markReminderFailed(id) {
   );
 }
 
+async function findClientByName(userId, name) {
+  const { rows } = await pool.query(
+    `select *
+     from public.clients
+     where user_id = $1 and lower(name) = lower($2)
+     limit 1`,
+    [userId, name.trim()]
+  );
+  return rows[0] || null;
+}
+
+async function setClientPhone(userId, name, phone) {
+  const { rows } = await pool.query(
+    `update public.clients
+     set phone = $3
+     where user_id = $1 and lower(name) = lower($2)
+     returning *`,
+    [userId, name.trim(), phone]
+  );
+  return rows[0] || null;
+}
+
 
 module.exports = {
   pool,
@@ -141,5 +163,8 @@ module.exports = {
   listDueReminders,
   markReminderSent,
   markReminderFailed,
+  findClientByName,
+  setClientPhone,
+
 
 };
