@@ -28,14 +28,22 @@ const connectionString = DATABASE_URL.includes("sslmode=")
   ? DATABASE_URL
   : DATABASE_URL + (DATABASE_URL.includes("?") ? "&" : "?") + "sslmode=require";
 
+// ✅ Pool robusto contra SELF_SIGNED_CERT_IN_CHAIN en Render + Supabase
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: false },
+  ssl: {
+    rejectUnauthorized: false,
+    checkServerIdentity: () => undefined,
+  },
   max: 5,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000,
   keepAlive: true,
   family: 4,
+});
+
+pool.on("error", (err) => {
+  console.error("PG pool error:", err);
 });
 
 const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
