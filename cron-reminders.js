@@ -1,5 +1,5 @@
 // cron-reminders.js
-// Envía al DUEÑO (user.phone) un resumen diario de deudas pendientes.
+// Envía al DUEÑO (user.phone) un resumen de deudas pendientes.
 // Diseñado para ejecutarse como Render Cron Job.
 
 require("dotenv").config();
@@ -10,31 +10,32 @@ const { pool } = require("./db");
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
-// En sandbox suele ser: whatsapp:+14155238886
-// En producción: tu número habilitado por Twilio WhatsApp
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+// En Twilio Sandbox suele ser: whatsapp:+14155238886
+const TWILIO_WHATSAPP_FROM =
+  process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
 
-// Para evitar spam, registramos cada envío en una tabla reminder_logs.
-// Así no manda lo mismo 20 veces.
+// Evita mandar la misma deuda muchas veces (cooldown por deuda)
 const DEFAULT_COOLDOWN_HOURS = Number(process.env.REMINDER_COOLDOWN_HOURS || 20);
 
 // Cuántas deudas máximo incluir en el mensaje
 const MAX_ITEMS = Number(process.env.REMINDER_MAX_ITEMS || 5);
 
-// Oculta montos muy pequeños en el resumen (solo UX, no borra datos)
+// Paso A: ocultar montos muy pequeños del resumen (solo UX; no borra datos)
 const MIN_AMOUNT_TO_SHOW = Number(process.env.REMINDER_MIN_AMOUNT || 50);
-
 
 function fmtMoney(n) {
   try {
-    return new Intl.NumberFormat("es-MX", { style: "currency", currency: "MXN" }).format(Number(n || 0));
+    return new Intl.NumberFormat("es-MX", {
+      style: "currency",
+      currency: "MXN",
+    }).format(Number(n || 0));
   } catch {
     return `$${Number(n || 0).toFixed(2)}`;
   }
 }
 
 async function ensureTables() {
-  // Tabla para registrar envíos y evitar duplicados
+  // Tabla para registrar envíos y evitar duplicados en el tiempo
   await pool.query(`
     create table if not exists public.reminder_logs (
       id bigserial primary key,
@@ -51,10 +52,7 @@ async function ensureTables() {
 }
 
 async function pickDebtsToRemind() {
-  // Selecciona deudas pending, y evita mandar la misma deuda si ya se recordó en las últimas N horas.
-  // Asume tablas:
-  // users(id, phone)
-  // debts(id, user_id, client_name, amount_due, due_text, status, created_at)
+  // Selecciona deudas pending, y evita recordar la misma deuda si ya se recordó en las últimas N horas.
   const { rows } = await pool.query(
     `
     select
@@ -81,7 +79,7 @@ async function pickDebtsToRemind() {
     [String(DEFAULT_COOLDOWN_HOURS)]
   );
 
-  // Agrupar por usuario para mandar 1 mensaje por usuario con varias deudas
+  // Agrupar por usuario
   const byUser = new Map();
   for (const r of rows) {
     const key = r.user_id;
@@ -92,16 +90,19 @@ async function pickDebtsToRemind() {
 }
 
 function buildMessageForUser(items) {
-  // 1) Filtra por monto para que el resumen se vea profesional
-  const filtered = items.filter((it) => Number(it.amount_due || 0) >= MIN_AMOUNT_TO_SHOW);
+  // PASO A: limpiar resumen
+  // 1) filtra montos pequeños
+  const filtered = items.filter(
+    (it) => Number(it.amount_due || 0) >= MIN_AMOUNT_TO_SHOW
+  );
 
-  // Si al filtrar se queda vacío, usamos los primeros (para no mandar un mensaje “sin contenido”)
+  // si queda vacío, usa la lista original para no mandar mensaje sin contenido
   const baseList = filtered.length ? filtered : items;
 
-  // 2) Tomamos MAX_ITEMS de la lista base
+  // 2) top N
   const top = baseList.slice(0, MAX_ITEMS);
 
-  // 3) Total recuperable (de lo que mostramos)
+  // 3) total de lo mostrado
   const total = top.reduce((sum, it) => sum + Number(it.amount_due || 0), 0);
 
   let msg = `📌 *Recordatorio de cobranza (hoy)*\n\n`;
@@ -117,7 +118,6 @@ function buildMessageForUser(items) {
     msg += `• *${name}*: ${fmtMoney(it.amount_due)}${since}\n`;
   }
 
-  // Conteo “más pendientes” basado en la lista que usamos (baseList)
   if (baseList.length > top.length) {
     msg += `\n(+${baseList.length - top.length} más pendientes)\n`;
   }
@@ -132,24 +132,10 @@ function buildMessageForUser(items) {
   return msg;
 }
 
-
-  if (items.length > top.length) {
-    msg += `\n(+${items.length - top.length} más pendientes)\n`;
-  }
-
-  msg += `\nResponde aquí con uno de estos:\n`;
-  msg += `• "¿A quién cobro primero?"\n`;
-  msg += `• "Manda recordatorio a {Nombre}"\n`;
-  msg += `• "¿Quién me debe?"\n`;
-
-  return msg;
-}
-
 async function sendWhatsApp(to, body) {
   const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
-  // Normaliza: si guardaste "whatsapp:+52..." ya está perfecto.
-  // Si guardaste "+52..." le anteponemos whatsapp:
+  // users.phone debería ser whatsapp:+52...
   const normalizedTo = to.startsWith("whatsapp:") ? to : `whatsapp:${to}`;
 
   return client.messages.create({
@@ -161,6 +147,7 @@ async function sendWhatsApp(to, body) {
 
 async function logSent(userId, debtIds) {
   if (!debtIds.length) return;
+
   const values = [];
   const params = [];
   let i = 1;
@@ -171,14 +158,16 @@ async function logSent(userId, debtIds) {
   }
 
   await pool.query(
-    `insert into public.reminder_logs (user_id, debt_id) values ${params.join(", ")};`,
+    `insert into public.reminder_logs (user_id, debt_id) values ${params.join(
+      ", "
+    )};`,
     values
   );
 }
 
 async function main() {
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
-    throw new Error("Faltan TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN en variables de entorno.");
+    throw new Error("Faltan TWILIO_ACCOUNT_SID o TWILIO_AUTH_TOKEN");
   }
 
   await ensureTables();
@@ -195,10 +184,14 @@ async function main() {
     // Enviar 1 mensaje por usuario
     await sendWhatsApp(phone, message);
 
-    // Registrar “enviados” (solo los que metimos en el mensaje)
-    const sentDebtIds = items.slice(0, MAX_ITEMS).map((x) => x.debt_id);
-    await logSent(userId, sentDebtIds);
+    // Registrar enviados (solo los incluidos en el top)
+    const baseList = items.filter(
+      (it) => Number(it.amount_due || 0) >= MIN_AMOUNT_TO_SHOW
+    );
+    const useList = baseList.length ? baseList : items;
+    const sentDebtIds = useList.slice(0, MAX_ITEMS).map((x) => x.debt_id);
 
+    await logSent(userId, sentDebtIds);
     totalMsgs += 1;
   }
 
