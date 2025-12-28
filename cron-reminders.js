@@ -198,14 +198,23 @@ async function sendDailyOwnerSummaries() {
 async function main() {
   console.log("Cron start:", new Date().toISOString());
 
-  // 1) recordatorios vencidos
-  const r1 = await sendDueReminders(80);
+  let r1 = 0, r2 = 0;
 
-  // 2) resumen diario
-  const r2 = await sendDailyOwnerSummaries();
+  try {
+    r1 = await sendDueReminders(80);
+  } catch (e) {
+    console.error("sendDueReminders failed:", e?.message || e);
+  }
+
+  try {
+    r2 = await sendDailyOwnerSummaries();
+  } catch (e) {
+    console.error("sendDailyOwnerSummaries failed:", e?.message || e);
+  }
 
   console.log("Cron done.", { dueRemindersSent: r1, dailySummariesSent: r2 });
 }
+
 
 // Ejecuta y garantiza cierre
 main()
