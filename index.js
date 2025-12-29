@@ -473,21 +473,21 @@ if (mPaid) {
       return res.type("text/xml").send(twiml.toString());
     }
 
-    // =========================
-    // 6) AYUDA
-    // =========================
-    if (parsed.intent === "help") {
-      twiml.message(
-        `Así te ayudo:\n` +
-          `1) "Juan me debe 8500 desde el 3 de mayo"\n` +
-          `2) "¿Quién me debe?"\n` +
-          `3) "¿A quién cobro primero?"\n` +
-          `\nTambién entiendo: "me deben 2k".\n` +
-          `Y para guardar teléfono: "Guarda teléfono de Juan +5218..."`
-          "Marcar pagado Juan"
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
+   // =========================
+// 6) AYUDA
+// =========================
+if (parsed.intent === "help") {
+  twiml.message(
+    "Así te ayudo:\n" +
+      '1) "Juan me debe 8500 desde el 3 de mayo"\n' +
+      '2) "¿Quién me debe?"\n' +
+      '3) "¿A quién cobro primero?"\n' +
+      '4) "Guarda teléfono de Juan +5218..."\n' +
+      '5) "Manda recordatorio a Juan"\n' +
+      '\nTip: también entiendo "me deben 2k".'
+  );
+  return res.type("text/xml").send(twiml.toString());
+}
 
     // =========================
     // DEFAULT
