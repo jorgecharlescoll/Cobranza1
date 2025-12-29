@@ -67,6 +67,7 @@ async function updateUser(phone, patch) {
   if (rows.length) return rows[0];
 
   await getOrCreateUser(phone);
+
   const { rows: rows2 } = await pool.query(
     `update public.users
      set ${sets.join(", ")}, updated_at = now()
@@ -74,6 +75,7 @@ async function updateUser(phone, patch) {
      returning *`,
     values
   );
+
   return rows2[0];
 }
 
@@ -102,6 +104,44 @@ async function listPendingDebts(userId) {
   return rows;
 }
 
+async function listDebtsByClient(userId, clientName, limit = 20) {
+  const { rows } = await pool.query(
+    `
+    select id, client_name, amount_due, due_text, status, created_at
+    from public.debts
+    where user_id = $1
+      and lower(client_name) = lower($2)
+    order by created_at desc
+    limit $3
+    `,
+    [userId, clientName, limit]
+  );
+  return rows;
+}
+
+async function markLatestDebtPaid(userId, clientName) {
+  // Marca como pagada la deuda pendiente más reciente de ese cliente
+  const { rows } = await pool.query(
+    `
+    update public.debts
+    set status = 'paid'
+    where id = (
+      select id
+      from public.debts
+      where user_id = $1
+        and status = 'pending'
+        and lower(client_name) = lower($2)
+      order by created_at desc
+      limit 1
+    )
+    returning *
+    `,
+    [userId, clientName]
+  );
+
+  return rows[0] || null;
+}
+
 // =========================
 // CLIENTS (para teléfonos)
 // =========================
@@ -125,11 +165,13 @@ async function upsertClient(userId, name, phone = null) {
   if (!nm) return null;
 
   const existing = await findClientByName(userId, nm);
+
+  // Si existe, actualiza teléfono si cambió (SIN updated_at, porque no existe en clients)
   if (existing) {
     if (phone && phone !== existing.phone) {
       const { rows } = await pool.query(
         `update public.clients
-         set phone = $3, updated_at = now()
+         set phone = $3
          where user_id = $1 and lower(name) = lower($2)
          returning *`,
         [userId, nm, phone]
@@ -139,6 +181,7 @@ async function upsertClient(userId, name, phone = null) {
     return existing;
   }
 
+  // Si no existe, lo crea
   const { rows } = await pool.query(
     `insert into public.clients (user_id, name, phone)
      values ($1, $2, $3)
@@ -197,36 +240,18 @@ async function markReminderFailed(id) {
   );
 }
 
-async function markLatestDebtPaid(userId, clientName) {
-  // Marca como pagada la deuda pendiente más reciente de ese cliente
-  const { rows } = await pool.query(
-    `
-    update public.debts
-    set status = 'paid'
-    where id = (
-      select id
-      from public.debts
-      where user_id = $1
-        and status = 'pending'
-        and lower(client_name) = lower($2)
-      order by created_at desc
-      limit 1
-    )
-    returning *
-    `,
-    [userId, clientName]
-  );
-
-  return rows[0] || null;
-}
-
-
 module.exports = {
   pool,
+
+  // users
   getOrCreateUser,
   updateUser,
+
+  // debts
   addDebt,
   listPendingDebts,
+  listDebtsByClient,
+  markLatestDebtPaid,
 
   // clients
   findClientByName,
@@ -238,6 +263,4 @@ module.exports = {
   listDueReminders,
   markReminderSent,
   markReminderFailed,
-  markLatestDebtPaid,
-
 };
