@@ -468,20 +468,37 @@ app.post("/webhook/whatsapp", async (req, res) => {
   }
 
   // 4) Enviar WhatsApp vía Twilio
-  const msg =
-    `Hola ${clientName} 👋\n` +
-    `Te escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?` +
-    debtLine;
+  // === TONO (amable | firme | urgente) ===
+// Se detecta desde el texto original del usuario.
+// Ejemplos: "Manda recordatorio firme a Juan", "manda recordatorio urgente a Federico"
+const t = body.toLowerCase();
+const tone =
+  /\burgente\b/.test(t) ? "urgente" :
+  /\bfirme\b/.test(t) ? "firme" :
+  "amable";
 
-  const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+// 4) Plantillas por tono
+const templates = {
+  amable: (name, debtLine) =>
+    `Hola ${name} 👋\n` +
+    `Solo para recordarte un pago pendiente. ¿Me confirmas cuándo podrías cubrirlo?` +
+    debtLine,
 
-  await twilioClient.messages.create({
-    from: process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886",
-    to: toPhone,
-    body: msg,
-  });
+  firme: (name, debtLine) =>
+    `Hola ${name}.\n` +
+    `Te escribo para solicitar el pago pendiente. Por favor indícame hoy mismo cuándo lo vas a liquidar.` +
+    debtLine,
 
-  twiml.message(`✅ Listo. Envié el recordatorio a *${clientName}*.`);
+  urgente: (name, debtLine) =>
+    `Hola ${name}.\n` +
+    `⚠️ Urgente: necesito que regularices el pago pendiente hoy. Confírmame en este momento hora/fecha de pago.` +
+    debtLine,
+};
+
+const msg = templates[tone](clientName, debtLine);
+
+  twiml.message(`✅ Listo. Envié un recordatorio *${tone}* a *${clientName}*.`);
+
   return res.type("text/xml").send(twiml.toString());
 }
 
