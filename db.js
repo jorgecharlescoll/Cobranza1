@@ -1,266 +1,108 @@
 // db.js
 const { Pool } = require("pg");
 
-// 1) DATABASE_URL obligatorio
-const raw = process.env.DATABASE_URL;
-if (!raw) throw new Error("DATABASE_URL is not set");
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set");
+}
 
-// 2) Asegura sslmode=require en el string (por si se te olvida en Render)
-const connectionString = raw.includes("sslmode=")
-  ? raw
-  : raw + (raw.includes("?") ? "&" : "?") + "sslmode=require";
-
-// 3) Pool estable para Render + Supabase pooler
 const pool = new Pool({
-  connectionString,
-  ssl: { rejectUnauthorized: false },
-  max: Number(process.env.PG_POOL_MAX || 5),
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 20000,
-  keepAlive: true,
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
+  max: 5,
+  idleTimeoutMillis: 10000,
+  connectionTimeoutMillis: 8000,
 });
 
-pool.on("error", (err) => {
-  console.error("PG pool error:", err);
+// Log claro al conectar
+pool.on("connect", () => {
+  console.log("✅ DB connected");
 });
 
-pool.on("connect", (client) => {
-  client.query("SET statement_timeout = 15000").catch(() => {});
-  client.query("SET idle_in_transaction_session_timeout = 15000").catch(() => {});
-});
+// Reintento simple y seguro
+async function safeQuery(fn, retries = 2) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (retries <= 0) throw err;
+    console.warn("⚠️ DB retry due to error:", err.code || err.message);
+    await new Promise((r) => setTimeout(r, 500));
+    return safeQuery(fn, retries - 1);
+  }
+}
 
-// =========================
-// USERS
-// =========================
 async function getOrCreateUser(phone) {
-  const { rows } = await pool.query(
-    `insert into public.users (phone)
-     values ($1)
-     on conflict (phone) do update set updated_at = now()
-     returning *`,
-    [phone]
-  );
-  return rows[0];
+  return safeQuery(async () => {
+    const { rows } = await pool.query(
+      `
+      INSERT INTO users (phone)
+      VALUES ($1)
+      ON CONFLICT (phone)
+      DO UPDATE SET updated_at = NOW()
+      RETURNING *
+      `,
+      [phone]
+    );
+    return rows[0];
+  });
 }
 
 async function updateUser(phone, patch) {
   const keys = Object.keys(patch || {});
   if (!keys.length) return getOrCreateUser(phone);
 
-  const sets = [];
-  const values = [phone];
-  let i = 2;
+  return safeQuery(async () => {
+    const sets = keys.map((k, i) => `${k} = $${i + 2}`).join(", ");
+    const values = [phone, ...keys.map((k) => patch[k])];
 
-  for (const k of keys) {
-    sets.push(`${k} = $${i++}`);
-    values.push(patch[k]);
-  }
+    const { rows } = await pool.query(
+      `
+      UPDATE users
+      SET ${sets}, updated_at = NOW()
+      WHERE phone = $1
+      RETURNING *
+      `,
+      values
+    );
 
-  const { rows } = await pool.query(
-    `update public.users
-     set ${sets.join(", ")}, updated_at = now()
-     where phone = $1
-     returning *`,
-    values
-  );
-
-  if (rows.length) return rows[0];
-
-  await getOrCreateUser(phone);
-
-  const { rows: rows2 } = await pool.query(
-    `update public.users
-     set ${sets.join(", ")}, updated_at = now()
-     where phone = $1
-     returning *`,
-    values
-  );
-
-  return rows2[0];
+    return rows[0];
+  });
 }
 
-// =========================
-// DEBTS
-// =========================
 async function addDebt(userId, clientName, amountDue, dueText) {
-  const { rows } = await pool.query(
-    `insert into public.debts (user_id, client_name, amount_due, due_text, status)
-     values ($1, $2, $3, $4, 'pending')
-     returning *`,
-    [userId, clientName, amountDue, dueText || null]
-  );
-  return rows[0];
+  return safeQuery(async () => {
+    const { rows } = await pool.query(
+      `
+      INSERT INTO debts (user_id, client_name, amount_due, due_text, status)
+      VALUES ($1, $2, $3, $4, 'pending')
+      RETURNING *
+      `,
+      [userId, clientName, amountDue, dueText]
+    );
+    return rows[0];
+  });
 }
 
 async function listPendingDebts(userId) {
-  const { rows } = await pool.query(
-    `select *
-     from public.debts
-     where user_id = $1 and status = 'pending'
-     order by created_at desc
-     limit 50`,
-    [userId]
-  );
-  return rows;
-}
-
-async function listDebtsByClient(userId, clientName, limit = 20) {
-  const { rows } = await pool.query(
-    `
-    select id, client_name, amount_due, due_text, status, created_at
-    from public.debts
-    where user_id = $1
-      and lower(client_name) = lower($2)
-    order by created_at desc
-    limit $3
-    `,
-    [userId, clientName, limit]
-  );
-  return rows;
-}
-
-async function markLatestDebtPaid(userId, clientName) {
-  // Marca como pagada la deuda pendiente más reciente de ese cliente
-  const { rows } = await pool.query(
-    `
-    update public.debts
-    set status = 'paid'
-    where id = (
-      select id
-      from public.debts
-      where user_id = $1
-        and status = 'pending'
-        and lower(client_name) = lower($2)
-      order by created_at desc
-      limit 1
-    )
-    returning *
-    `,
-    [userId, clientName]
-  );
-
-  return rows[0] || null;
-}
-
-// =========================
-// CLIENTS (para teléfonos)
-// =========================
-async function findClientByName(userId, name) {
-  const nm = (name || "").trim();
-  if (!nm) return null;
-
-  const { rows } = await pool.query(
-    `select *
-     from public.clients
-     where user_id = $1 and lower(name) = lower($2)
-     limit 1`,
-    [userId, nm]
-  );
-  return rows[0] || null;
-}
-
-// “Upsert” por lógica (sin UNIQUE fancy)
-async function upsertClient(userId, name, phone = null) {
-  const nm = (name || "").trim();
-  if (!nm) return null;
-
-  const existing = await findClientByName(userId, nm);
-
-  // Si existe, actualiza teléfono si cambió (SIN updated_at, porque no existe en clients)
-  if (existing) {
-    if (phone && phone !== existing.phone) {
-      const { rows } = await pool.query(
-        `update public.clients
-         set phone = $3
-         where user_id = $1 and lower(name) = lower($2)
-         returning *`,
-        [userId, nm, phone]
-      );
-      return rows[0] || existing;
-    }
-    return existing;
-  }
-
-  // Si no existe, lo crea
-  const { rows } = await pool.query(
-    `insert into public.clients (user_id, name, phone)
-     values ($1, $2, $3)
-     returning *`,
-    [userId, nm, phone || null]
-  );
-  return rows[0];
-}
-
-// Guardar teléfono: si no existe, crea el cliente; si existe, actualiza
-async function setClientPhone(userId, name, phone) {
-  return upsertClient(userId, name, phone);
-}
-
-// =========================
-// REMINDERS
-// =========================
-async function createReminder({ userId, toPhone, clientName, amountDue, remindAt, message }) {
-  const { rows } = await pool.query(
-    `insert into public.reminders (user_id, to_phone, client_name, amount_due, remind_at, message)
-     values ($1, $2, $3, $4, $5, $6)
-     returning *`,
-    [userId, toPhone, clientName || null, amountDue || null, remindAt, message]
-  );
-  return rows[0];
-}
-
-async function listDueReminders(limit = 50) {
-  const { rows } = await pool.query(
-    `select *
-     from public.reminders
-     where status = 'pending'
-       and remind_at <= now()
-     order by remind_at asc
-     limit $1`,
-    [limit]
-  );
-  return rows;
-}
-
-async function markReminderSent(id) {
-  await pool.query(
-    `update public.reminders
-     set status = 'sent', sent_at = now()
-     where id = $1`,
-    [id]
-  );
-}
-
-async function markReminderFailed(id) {
-  await pool.query(
-    `update public.reminders
-     set status = 'failed'
-     where id = $1`,
-    [id]
-  );
+  return safeQuery(async () => {
+    const { rows } = await pool.query(
+      `
+      SELECT *
+      FROM debts
+      WHERE user_id = $1 AND status = 'pending'
+      ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+    return rows;
+  });
 }
 
 module.exports = {
   pool,
-
-  // users
   getOrCreateUser,
   updateUser,
-
-  // debts
   addDebt,
   listPendingDebts,
-  listDebtsByClient,
-  markLatestDebtPaid,
-
-  // clients
-  findClientByName,
-  upsertClient,
-  setClientPhone,
-
-  // reminders
-  createReminder,
-  listDueReminders,
-  markReminderSent,
-  markReminderFailed,
 };
