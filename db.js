@@ -197,6 +197,30 @@ async function markReminderFailed(id) {
   );
 }
 
+async function markLatestDebtPaid(userId, clientName) {
+  // Marca como pagada la deuda pendiente más reciente de ese cliente
+  const { rows } = await pool.query(
+    `
+    update public.debts
+    set status = 'paid'
+    where id = (
+      select id
+      from public.debts
+      where user_id = $1
+        and status = 'pending'
+        and lower(client_name) = lower($2)
+      order by created_at desc
+      limit 1
+    )
+    returning *
+    `,
+    [userId, clientName]
+  );
+
+  return rows[0] || null;
+}
+
+
 module.exports = {
   pool,
   getOrCreateUser,
@@ -214,4 +238,6 @@ module.exports = {
   listDueReminders,
   markReminderSent,
   markReminderFailed,
+  markLatestDebtPaid,
+
 };
