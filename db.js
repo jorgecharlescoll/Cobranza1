@@ -99,10 +99,40 @@ async function listPendingDebts(userId) {
   });
 }
 
+/**
+ * findClientByName(userId, name)
+ * Devuelve el cliente (id, user_id, name, phone) o null
+ * - Case-insensitive
+ * - Prioriza match exacto, luego parcial
+ */
+async function findClientByName(userId, name) {
+  const clean = String(name || "").trim();
+  if (!clean) return null;
+
+  return safeQuery(async () => {
+    const { rows } = await pool.query(
+      `
+      SELECT id, user_id, name, phone
+      FROM clients
+      WHERE user_id = $1
+        AND name ILIKE $2
+      ORDER BY
+        CASE WHEN lower(name) = lower($3) THEN 0 ELSE 1 END,
+        length(name) ASC
+      LIMIT 1
+      `,
+      [userId, `%${clean}%`, clean]
+    );
+
+    return rows[0] || null;
+  });
+}
+
 module.exports = {
   pool,
   getOrCreateUser,
   updateUser,
   addDebt,
   listPendingDebts,
+  findClientByName, // ✅ MUY IMPORTANTE: exportar para que index.js la encuentre
 };
