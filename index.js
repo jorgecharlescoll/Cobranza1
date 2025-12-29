@@ -415,14 +415,76 @@ app.post("/webhook/whatsapp", async (req, res) => {
     // C) INICIAR RECORDATORIO GUIADO
     // =========================
     if (parsed.intent === "remind") {
-      const clientName = parsed.client_name || null;
-      const amount = parsed.amount_due || null;
+  const clientName = parsed.client_name || null;
 
-      let toPhone = null;
-      if (clientName) {
-        const client = await findClientByName(user.id, clientName);
-        if (client?.phone) toPhone = client.phone;
-      }
+  if (!clientName) {
+    twiml.message(
+      `¿A quién le mando el recordatorio?\n` +
+      `Ejemplo: "Manda recordatorio a Federico"`
+    );
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  // 1) Buscar teléfono en clients
+  const client = await findClientByName(user.id, clientName);
+
+  if (!client || !client.phone) {
+    twiml.message(
+      `No tengo el teléfono de "${clientName}".\n\n` +
+      `Guárdalo así:\n` +
+      `Guarda teléfono de ${clientName} +52XXXXXXXXXX`
+    );
+    return res.type("text/xml").send(twiml.toString());
+  }
+
+  // 2) Normaliza a formato Twilio WhatsApp (whatsapp:+52...)
+  const rawPhone = String(client.phone).trim();
+  const digits = rawPhone.replace(/[^\d+]/g, ""); // quita espacios, guiones, etc.
+  const e164 =
+    digits.startsWith("+") ? digits : `+${digits}`; // por si guardaron 521...
+  const toPhone = e164.startsWith("whatsapp:")
+    ? e164
+    : `whatsapp:${e164}`;
+
+  // 3) Intenta incluir monto + antigüedad si existe una deuda pendiente para ese cliente
+  let debtLine = "";
+  try {
+    const debts = await listPendingDebts(user.id);
+    const match = debts.find(
+      (d) => String(d.client_name || "").toLowerCase() === String(clientName).toLowerCase()
+    );
+
+    if (match) {
+      const amt = Number(match.amount_due || 0).toLocaleString("es-MX", {
+        style: "currency",
+        currency: "MXN",
+      });
+      debtLine =
+        `\n\nDeuda registrada: ${amt}` +
+        (match.due_text ? ` (desde ${match.due_text})` : "");
+    }
+  } catch (_) {
+    // si algo falla aquí, no bloqueamos el envío
+  }
+
+  // 4) Enviar WhatsApp vía Twilio
+  const msg =
+    `Hola ${clientName} 👋\n` +
+    `Te escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?` +
+    debtLine;
+
+  const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+  await twilioClient.messages.create({
+    from: process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886",
+    to: toPhone,
+    body: msg,
+  });
+
+  twiml.message(`✅ Listo. Envié el recordatorio a *${clientName}*.`);
+  return res.type("text/xml").send(twiml.toString());
+}
+
 
       await updateUser(phone, {
         pending_action: "remind_choose_tone",
