@@ -73,6 +73,16 @@ async function addDebt(userId, clientName, amountDue, dueText) {
   return rows[0];
 }
 
+async function findClientByName(userId, name) { /* ... */ }
+async function setClientPhone(userId, name, phone) { /* ... */ }
+
+module.exports = {
+  // ...
+  findClientByName,
+  setClientPhone,
+};
+
+
 async function listPendingDebts(userId) {
   const { rows } = await pool.query(
     `
