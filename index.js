@@ -486,18 +486,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
 }
 
 
-      await updateUser(phone, {
-        pending_action: "remind_choose_tone",
-        pending_payload: { clientName, amount, toPhone },
-      });
-
-      twiml.message(
-        `¿Qué tono quieres para el recordatorio${
-          clientName ? ` a *${clientName}*` : ""
-        }?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
 
     // =========================
     // 6) AYUDA
