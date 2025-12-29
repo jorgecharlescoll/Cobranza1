@@ -14,9 +14,9 @@ const {
   markReminderFailed,
   findClientByName,
   setClientPhone,
+  upsertClient
 } = require("./db");
 
-const { upsertClient, ... } = require("./db");
 
 const { parseMessage } = require("./ai");
 

@@ -1,11 +1,11 @@
 // db.js
 const { Pool } = require("pg");
 
-// 1) Lee DATABASE_URL
+// 1) DATABASE_URL obligatorio
 const raw = process.env.DATABASE_URL;
 if (!raw) throw new Error("DATABASE_URL is not set");
 
-// 2) Fuerza sslmode=require en el string (por si en Render se te olvida)
+// 2) Asegura sslmode=require en el string (por si se te olvida en Render)
 const connectionString = raw.includes("sslmode=")
   ? raw
   : raw + (raw.includes("?") ? "&" : "?") + "sslmode=require";
@@ -13,12 +13,11 @@ const connectionString = raw.includes("sslmode=")
 // 3) Pool estable para Render + Supabase pooler
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: false }, // evita SELF_SIGNED_CERT_IN_CHAIN
+  ssl: { rejectUnauthorized: false },
   max: Number(process.env.PG_POOL_MAX || 5),
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 20000,
   keepAlive: true,
-  family: 4,
 });
 
 pool.on("error", (err) => {
@@ -68,7 +67,6 @@ async function updateUser(phone, patch) {
   if (rows.length) return rows[0];
 
   await getOrCreateUser(phone);
-
   const { rows: rows2 } = await pool.query(
     `update public.users
      set ${sets.join(", ")}, updated_at = now()
@@ -102,6 +100,57 @@ async function listPendingDebts(userId) {
     [userId]
   );
   return rows;
+}
+
+// =========================
+// CLIENTS (para teléfonos)
+// =========================
+async function findClientByName(userId, name) {
+  const nm = (name || "").trim();
+  if (!nm) return null;
+
+  const { rows } = await pool.query(
+    `select *
+     from public.clients
+     where user_id = $1 and lower(name) = lower($2)
+     limit 1`,
+    [userId, nm]
+  );
+  return rows[0] || null;
+}
+
+// “Upsert” por lógica (sin UNIQUE fancy)
+async function upsertClient(userId, name, phone = null) {
+  const nm = (name || "").trim();
+  if (!nm) return null;
+
+  const existing = await findClientByName(userId, nm);
+  if (existing) {
+    if (phone && phone !== existing.phone) {
+      const { rows } = await pool.query(
+        `update public.clients
+         set phone = $3, updated_at = now()
+         where user_id = $1 and lower(name) = lower($2)
+         returning *`,
+        [userId, nm, phone]
+      );
+      return rows[0] || existing;
+    }
+    return existing;
+  }
+
+  const { rows } = await pool.query(
+    `insert into public.clients (user_id, name, phone)
+     values ($1, $2, $3)
+     returning *`,
+    [userId, nm, phone || null]
+  );
+  return rows[0];
+}
+
+// Guardar teléfono: si no existe, crea el cliente; si existe, actualiza
+async function setClientPhone(userId, name, phone) {
+  return upsertClient(userId, name, phone);
 }
 
 // =========================
@@ -148,68 +197,21 @@ async function markReminderFailed(id) {
   );
 }
 
-// =========================
-// CLIENTS (teléfonos)
-// =========================
-async function findClientByName(userId, name) {
-  const clean = (name || "").trim();
-  const { rows } = await pool.query(
-    `select *
-     from public.clients
-     where user_id = $1 and lower(name) = lower($2)
-     limit 1`,
-    [userId, clean]
-  );
-  return rows[0] || null;
-}
-
-async function setClientPhone(userId, name, phone) {
-  const clean = (name || "").trim();
-  const { rows } = await pool.query(
-    `update public.clients
-     set phone = $3
-     where user_id = $1 and lower(name) = lower($2)
-     returning *`,
-    [userId, clean, phone]
-  );
-  return rows[0] || null;
-}
-
-function makeNameKey(name) {
-  return String(name || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
-
-async function upsertClient(userId, name) {
-  const clean = String(name || "").trim();
-  const key = makeNameKey(clean);
-
-  const { rows } = await pool.query(
-    `insert into public.clients (user_id, name, name_key)
-     values ($1, $2, $3)
-     on conflict (user_id, name_key)
-     do update set name = excluded.name, updated_at = now()
-     returning *`,
-    [userId, clean, key]
-  );
-  return rows[0];
-}
-
-
 module.exports = {
   pool,
   getOrCreateUser,
   updateUser,
   addDebt,
   listPendingDebts,
+
+  // clients
+  findClientByName,
+  upsertClient,
+  setClientPhone,
+
+  // reminders
   createReminder,
   listDueReminders,
   markReminderSent,
   markReminderFailed,
-  findClientByName,
-  setClientPhone,
-  upsertClient,
-
 };
