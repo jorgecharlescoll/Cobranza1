@@ -175,6 +175,29 @@ async function setClientPhone(userId, name, phone) {
   return rows[0] || null;
 }
 
+function makeNameKey(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+async function upsertClient(userId, name) {
+  const clean = String(name || "").trim();
+  const key = makeNameKey(clean);
+
+  const { rows } = await pool.query(
+    `insert into public.clients (user_id, name, name_key)
+     values ($1, $2, $3)
+     on conflict (user_id, name_key)
+     do update set name = excluded.name, updated_at = now()
+     returning *`,
+    [userId, clean, key]
+  );
+  return rows[0];
+}
+
+
 module.exports = {
   pool,
   getOrCreateUser,
@@ -187,4 +210,6 @@ module.exports = {
   markReminderFailed,
   findClientByName,
   setClientPhone,
+  upsertClient,
+
 };

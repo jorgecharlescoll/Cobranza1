@@ -16,6 +16,8 @@ const {
   setClientPhone,
 } = require("./db");
 
+const { upsertClient, ... } = require("./db");
+
 const { parseMessage } = require("./ai");
 
 const app = express();
@@ -352,6 +354,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
 
       const since = parsed.since_text || null;
+
+      await upsertClient(user.id, clientName);
+
 
       const debt = await addDebt(user.id, clientName, amount, since);
       const amt = Number(debt.amount_due).toLocaleString("es-MX", {
