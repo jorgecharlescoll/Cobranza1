@@ -1,4 +1,4 @@
-// db.js
+// db.js — FlowSense
 const { Pool } = require("pg");
 
 if (!process.env.DATABASE_URL) {
@@ -32,6 +32,9 @@ async function safeQuery(fn, retries = 2) {
   }
 }
 
+// -------------------------
+// USERS
+// -------------------------
 async function getOrCreateUser(phone) {
   return safeQuery(async () => {
     const { rows } = await pool.query(
@@ -70,6 +73,76 @@ async function updateUser(phone, patch) {
   });
 }
 
+// -------------------------
+// CLIENTS
+// -------------------------
+async function findClientByName(userId, name) {
+  if (!userId || !name) return null;
+  return safeQuery(async () => {
+    const { rows } = await pool.query(
+      `
+      SELECT *
+      FROM clients
+      WHERE user_id = $1 AND LOWER(name) = LOWER($2)
+      LIMIT 1
+      `,
+      [userId, name]
+    );
+    return rows[0] || null;
+  });
+}
+
+async function upsertClient(userId, name) {
+  if (!userId || !name) return null;
+
+  return safeQuery(async () => {
+    // 1) intenta encontrar
+    const existing = await findClientByName(userId, name);
+    if (existing) return existing;
+
+    // 2) inserta si no existe (sin depender de constraints)
+    const { rows } = await pool.query(
+      `
+      INSERT INTO clients (user_id, name)
+      VALUES ($1, $2)
+      RETURNING *
+      `,
+      [userId, name]
+    );
+    return rows[0] || null;
+  });
+}
+
+async function setClientPhone(userId, name, phone) {
+  if (!userId || !name || !phone) return null;
+
+  return safeQuery(async () => {
+    // asegura cliente
+    const client = await upsertClient(userId, name);
+    if (!client) return null;
+
+    const { rows } = await pool.query(
+      `
+      UPDATE clients
+      SET phone = $1, updated_at = NOW()
+      WHERE user_id = $2 AND LOWER(name) = LOWER($3)
+      RETURNING *
+      `,
+      [phone, userId, name]
+    );
+
+    return rows[0] || null;
+  });
+}
+
+// alias por compatibilidad con versiones previas
+async function saveClientPhone(userId, name, phone) {
+  return setClientPhone(userId, name, phone);
+}
+
+// -------------------------
+// DEBTS
+// -------------------------
 async function addDebt(userId, clientName, amountDue, dueText) {
   return safeQuery(async () => {
     const { rows } = await pool.query(
@@ -99,29 +172,45 @@ async function listPendingDebts(userId) {
   });
 }
 
-/**
- * findClientByName(userId, name)
- * Devuelve el cliente (id, user_id, name, phone) o null
- * - Case-insensitive
- * - Prioriza match exacto, luego parcial
- */
-async function findClientByName(userId, name) {
-  const clean = String(name || "").trim();
-  if (!clean) return null;
+async function listDebtsByClient(userId, clientName) {
+  if (!userId || !clientName) return [];
+  return safeQuery(async () => {
+    const { rows } = await pool.query(
+      `
+      SELECT *
+      FROM debts
+      WHERE user_id = $1
+        AND LOWER(client_name) = LOWER($2)
+        AND status = 'pending'
+      ORDER BY created_at DESC
+      `,
+      [userId, clientName]
+    );
+    return rows;
+  });
+}
+
+async function markLatestDebtPaid(userId, clientName) {
+  if (!userId || !clientName) return null;
 
   return safeQuery(async () => {
     const { rows } = await pool.query(
       `
-      SELECT id, user_id, name, phone
-      FROM clients
-      WHERE user_id = $1
-        AND name ILIKE $2
-      ORDER BY
-        CASE WHEN lower(name) = lower($3) THEN 0 ELSE 1 END,
-        length(name) ASC
-      LIMIT 1
+      WITH latest AS (
+        SELECT id
+        FROM debts
+        WHERE user_id = $1
+          AND LOWER(client_name) = LOWER($2)
+          AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+      )
+      UPDATE debts
+      SET status = 'paid', updated_at = NOW()
+      WHERE id IN (SELECT id FROM latest)
+      RETURNING *
       `,
-      [userId, `%${clean}%`, clean]
+      [userId, clientName]
     );
 
     return rows[0] || null;
@@ -130,9 +219,20 @@ async function findClientByName(userId, name) {
 
 module.exports = {
   pool,
+
+  // users
   getOrCreateUser,
   updateUser,
+
+  // clients
+  findClientByName,
+  upsertClient,
+  setClientPhone,
+  saveClientPhone,
+
+  // debts
   addDebt,
   listPendingDebts,
-  findClientByName, // ✅ MUY IMPORTANTE: exportar para que index.js la encuentre
+  listDebtsByClient,
+  markLatestDebtPaid,
 };
