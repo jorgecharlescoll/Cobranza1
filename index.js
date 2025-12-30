@@ -8,6 +8,7 @@ const Stripe = require("stripe");
 
 const { parseMessage } = require("./ai");
 const {
+  pool,
   getOrCreateUser,
   updateUser,
   addDebt,
@@ -406,8 +407,53 @@ app.get("/stripe/success", (_, res) => res.status(200).send("Pago recibido. Ya p
 app.get("/stripe/cancel", (_, res) => res.status(200).send("Pago cancelado. Puedes volver a WhatsApp y escribir PAGAR cuando gustes."));
 
 // -------------------------
-// Stripe Webhook (Bloque 4)
+// Stripe Webhook (Bloque 4 + Idempotencia segura)
 // -------------------------
+async function acquireStripeEventLock(event) {
+  // Inserta el event_id. Si ya existe, NO proceses (idempotencia).
+  // Devuelve true si es nuevo (puedes procesar), false si es duplicado.
+  try {
+    const r = await pool.query(
+      `
+      insert into public.stripe_events (event_id, type, meta)
+      values ($1, $2, $3)
+      on conflict (event_id) do nothing
+      returning event_id
+      `,
+      [
+        event.id,
+        event.type,
+        {
+          created: event.created || null,
+          livemode: event.livemode || null,
+        },
+      ]
+    );
+    return (r.rows || []).length > 0;
+  } catch (err) {
+    console.error("❌ acquireStripeEventLock error:", err?.message);
+    // Por seguridad: si no pudimos asegurar lock, NO procesamos para evitar duplicados
+    return false;
+  }
+}
+
+async function markStripeEventProcessed(eventId) {
+  try {
+    await pool.query(`update public.stripe_events set processed_at = now() where event_id = $1`, [eventId]);
+  } catch (_) {
+    // best-effort
+  }
+}
+
+async function releaseStripeEventLockIfUnprocessed(eventId) {
+  // ✅ clave: si falló el procesamiento, borramos el lock para que Stripe reintente
+  try {
+    await pool.query(`delete from public.stripe_events where event_id = $1 and processed_at is null`, [eventId]);
+  } catch (_) {
+    // best-effort
+  }
+}
+
 app.post("/webhook/stripe", async (req, res) => {
   if (!stripeReady()) return res.status(500).send("Stripe not configured");
 
@@ -419,6 +465,13 @@ app.post("/webhook/stripe", async (req, res) => {
   } catch (err) {
     console.error("❌ Stripe webhook signature failed:", err?.message);
     return res.status(400).send(`Webhook Error: ${err?.message}`);
+  }
+
+  // ✅ Idempotencia: si Stripe reintenta el mismo evento, lo ignoramos
+  const isNewEvent = await acquireStripeEventLock(event);
+  if (!isNewEvent) {
+    console.log("⚠️ Stripe duplicate event ignored:", event.id, event.type);
+    return res.json({ received: true, deduped: true });
   }
 
   // Helper: get phone from subscription metadata (preferred)
@@ -684,10 +737,15 @@ app.post("/webhook/stripe", async (req, res) => {
       }
     }
 
+    await markStripeEventProcessed(event.id);
     return res.json({ received: true });
   } catch (err) {
     console.error("❌ Stripe webhook handler error:", err);
     metric("ERROR", { stage: "stripe_webhook", message: err?.message || "unknown" });
+
+    // ✅ IMPORTANTE: libera el lock si NO se marcó processed_at
+    await releaseStripeEventLockIfUnprocessed(event.id);
+
     return res.status(500).send("Webhook handler failed");
   }
 });
