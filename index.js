@@ -1,5 +1,5 @@
-// index.js — FlowSense (hardened production MVP)
-// v-2025-12-29-HARDENED-1
+// index.js — FlowSense (clean production MVP + metrics logs)
+// v-2025-12-29-CLEAN-2-METRICS
 
 require("dotenv").config();
 const express = require("express");
@@ -22,43 +22,50 @@ const {
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const VERSION = "v-2025-12-29-HARDENED-1";
+const VERSION = "v-2025-12-29-CLEAN-2-METRICS";
 
-/* =========================
-   CONFIG HARDENING
-========================= */
-const WEBHOOK_TIMEOUT_MS = 8000;
-const PARSE_TIMEOUT_MS = 3500;
-
-/* =========================
-   HELPERS
-========================= */
-function withTimeout(promise, ms, label = "timeout") {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(label)), ms)
-    ),
-  ]);
+// -------------------------
+// Logging + Metrics (logs only)
+// -------------------------
+function isoNow() {
+  return new Date().toISOString();
+}
+function dayKey() {
+  return new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+}
+function makeReqId() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+function logEvent(event, data = {}) {
+  console.log(`[${event}]`, JSON.stringify({ ts: isoNow(), ...data }));
+}
+function metric(event, data = {}) {
+  // Simple, grep-friendly
+  console.log(`[METRIC:${event}]`, JSON.stringify({ ts: isoNow(), ...data }));
 }
 
 function normalizePhoneToWhatsApp(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
 
+  // If already "whatsapp:+52..."
   if (s.toLowerCase().startsWith("whatsapp:")) {
     const num = s.slice("whatsapp:".length).trim();
     return "whatsapp:" + normalizePhoneToWhatsApp(num).replace("whatsapp:", "");
   }
 
+  // Remove spaces, parentheses, hyphens
   s = s.replace(/[()\s-]/g, "");
+
+  // Keep leading + if present, remove other non-digits
   const hasPlus = s.startsWith("+");
   s = s.replace(/[^\d+]/g, "");
   if (!s) return null;
 
+  // If no +, assume it's digits; if starts with 52 already, add +
   if (!hasPlus) {
     if (s.startsWith("52")) s = "+" + s;
-    else if (s.length === 10) s = "+52" + s;
+    else if (s.length === 10) s = "+52" + s; // assume MX 10-digit
     else s = "+" + s;
   }
 
@@ -66,7 +73,9 @@ function normalizePhoneToWhatsApp(raw) {
 }
 
 function normalizeText(s) {
-  return String(s || "").trim().replace(/\s+/g, " ");
+  return String(s || "")
+    .trim()
+    .replace(/\s+/g, " ");
 }
 
 function isYes(text) {
@@ -79,8 +88,74 @@ function isNo(text) {
   return ["no", "cancelar", "cancela", "alto", "detener"].includes(t);
 }
 
-function log(event, data = {}) {
-  console.log(`[${event}]`, JSON.stringify(data));
+// Very simple estimator from Spanish "desde ..."
+function estimateDays(dueText) {
+  if (!dueText) return 0;
+  const t = dueText.toLowerCase();
+
+  if (t.includes("hoy")) return 0;
+  if (t.includes("ayer")) return 1;
+
+  if (t.includes("semana")) {
+    const m = t.match(/(\d+)\s*seman/);
+    return m ? Number(m[1]) * 7 : 7;
+  }
+  if (t.includes("mes")) {
+    const m = t.match(/(\d+)\s*mes/);
+    return m ? Number(m[1]) * 30 : 30;
+  }
+  if (t.includes("año") || t.includes("ano")) {
+    const m = t.match(/(\d+)\s*a[nñ]o/);
+    return m ? Number(m[1]) * 365 : 365;
+  }
+
+  const months = [
+    ["enero", 30 * 11],
+    ["febrero", 30 * 10],
+    ["marzo", 30 * 9],
+    ["abril", 30 * 8],
+    ["mayo", 30 * 7],
+    ["junio", 30 * 6],
+    ["julio", 30 * 5],
+    ["agosto", 30 * 4],
+    ["septiembre", 30 * 3],
+    ["setiembre", 30 * 3],
+    ["octubre", 30 * 2],
+    ["noviembre", 30 * 1],
+    ["diciembre", 30 * 0],
+  ];
+  for (const [name, days] of months) {
+    if (t.includes(name)) return days || 15;
+  }
+
+  if (t.match(/\d{1,2}\s*de\s*[a-záéíóú]+/i)) return 60;
+
+  return 30;
+}
+
+function buildReminderMessage(tone, clientName, debtLine) {
+  const name = clientName || "hola";
+  const extra = debtLine ? `\n\n${debtLine}` : "";
+
+  if (tone === "firme") {
+    return (
+      `Hola ${name}.\n` +
+      `Te escribo para solicitar el pago pendiente. ¿Me confirmas hoy tu fecha y hora de pago?` +
+      extra
+    );
+  }
+  if (tone === "urgente") {
+    return (
+      `Hola ${name}.\n` +
+      `Este es un recordatorio URGENTE del pago pendiente. Necesito confirmación inmediata de cuándo lo vas a cubrir.` +
+      extra
+    );
+  }
+  return (
+    `Hola ${name} 👋\n` +
+    `Te escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?` +
+    extra
+  );
 }
 
 async function safeResetPending(phone) {
@@ -89,109 +164,470 @@ async function safeResetPending(phone) {
   } catch (_) {}
 }
 
-/* =========================
-   HEALTH
-========================= */
 app.get("/health", (_, res) => res.send(`ok ${VERSION}`));
 
-/* =========================
-   WEBHOOK
-========================= */
 app.post("/webhook/whatsapp", async (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twiml = new MessagingResponse();
 
-  const from = req.body.From;
-  const body = String(req.body.Body || "").trim();
+  const from = req.body.From; // whatsapp:+52...
+  const bodyRaw = req.body.Body || "";
+  const body = String(bodyRaw).trim();
 
-  log("INCOMING", { from, body });
+  const reqId = makeReqId();
+  const startedAt = Date.now();
+
+  logEvent("INCOMING", { reqId, from, body });
 
   try {
-    await withTimeout(
-      (async () => {
-        const phone = from;
-        const user = await getOrCreateUser(phone);
+    // 1) Usuario
+    const phone = from;
+    const user = await getOrCreateUser(phone);
 
-        if (!user.seen_onboarding) {
-          await updateUser(phone, { seen_onboarding: true });
-          twiml.message(
-            `👋 Soy FlowSense.\n\nPrueba:\n` +
-              `• "Juan me debe 8500 desde el 3 de mayo"\n` +
-              `• "¿Quién me debe?"\n` +
-              `• "¿A quién cobro primero?"\n` +
-              `• "Guarda teléfono de Juan +5218..."\n` +
-              `• "Manda recordatorio a Juan"`
-          );
-          return;
-        }
+    // MÉTRICA: usuario activo (para DAU por logs)
+    metric("USER_ACTIVE", { reqId, day: dayKey(), user_id: user.id, phone });
 
-        if (isNo(body)) {
-          await safeResetPending(phone);
-          twiml.message("Cancelado ✅");
-          return;
-        }
+    // 1.1) Onboarding simple
+    if (!user.seen_onboarding) {
+      await updateUser(phone, { seen_onboarding: true });
 
-        /* =========================
-           PARSER (timeout protegido)
-        ========================= */
-        let parsed;
-        try {
-          parsed = await withTimeout(
-            parseMessage(body),
-            PARSE_TIMEOUT_MS,
-            "parse_timeout"
-          );
-        } catch (err) {
-          log("PARSE_ERROR", { error: err.message });
-          twiml.message("⚠️ No te entendí bien. ¿Puedes intentar con otra frase?");
-          return;
-        }
+      metric("ONBOARDING_SHOWN", { reqId, user_id: user.id });
 
-        log("INTENT", { intent: parsed.intent });
+      twiml.message(
+        `👋 Soy FlowSense.\n\n` +
+          `Prueba:\n` +
+          `• "Juan me debe 8500 desde el 3 de mayo"\n` +
+          `• "¿Quién me debe?"\n` +
+          `• "¿A quién cobro primero?"\n` +
+          `• "Guarda teléfono de Juan +521833..."\n` +
+          `• "Manda recordatorio a Juan"\n`
+      );
 
-        /* =========================
-           RECORDATORIO
-        ========================= */
-        if (parsed.intent === "remind") {
-          const clientName = parsed.client_name;
-          if (!clientName) {
-            twiml.message(`¿A quién? Ejemplo: "Manda recordatorio a Juan"`);
-            return;
-          }
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
 
-          let toPhone = null;
-          const client = await findClientByName(user.id, clientName);
-          if (client?.phone) toPhone = client.phone;
+    // 1.2) Cancelar en cualquier estado
+    if (isNo(body)) {
+      await safeResetPending(phone);
+      metric("CANCELLED", { reqId, user_id: user.id, pending_action: user.pending_action || null });
 
-          await updateUser(phone, {
-            pending_action: "remind_choose_tone",
-            pending_payload: { clientName, toPhone },
-          });
+      twiml.message("Cancelado ✅");
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
 
-          twiml.message(
-            `¿Qué tono quieres?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
-          );
-          return;
-        }
+    // 1.3) Resolver estados pendientes (recordatorio por tonos)
+    if (user.pending_action === "remind_choose_tone") {
+      const t = normalizeText(body).toLowerCase();
+      let tone = null;
+      if (t.includes("amable")) tone = "amable";
+      else if (t.includes("firme")) tone = "firme";
+      else if (t.includes("urgente")) tone = "urgente";
 
-        /* =========================
-           DEFAULT
-        ========================= */
+      if (!tone) {
+        metric("REMINDER_TONE_INVALID", { reqId, user_id: user.id, input: body });
+
+        twiml.message(`Responde con uno:\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const payload = user.pending_payload || {};
+      const clientName = payload.clientName || null;
+      const toPhone = payload.toPhone || null;
+      const amount = payload.amount || null;
+
+      const debtLine = amount
+        ? `Monto: ${Number(amount).toLocaleString("es-MX", { style: "currency", currency: "MXN" })}`
+        : "";
+      const msg = buildReminderMessage(tone, clientName || "hola", debtLine);
+
+      await updateUser(phone, {
+        pending_action: "remind_confirm_send",
+        pending_payload: { ...payload, tone, msg },
+      });
+
+      metric("REMINDER_PREVIEW", {
+        reqId,
+        user_id: user.id,
+        tone,
+        has_client_phone: Boolean(toPhone),
+      });
+
+      twiml.message(
+        `📨 Este será el mensaje (${tone}):\n\n` +
+          `${msg}\n\n` +
+          (toPhone
+            ? `¿Lo envío a ${toPhone}? Responde "sí" o "no".`
+            : `No tengo el teléfono del cliente. ¿Quieres guardarlo primero?`)
+      );
+
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    if (user.pending_action === "remind_confirm_send") {
+      const payload = user.pending_payload || {};
+      const clientName = payload.clientName || "cliente";
+      const toPhone = payload.toPhone || null;
+      const msg = payload.msg || null;
+      const tone = payload.tone || null;
+
+      if (!isYes(body)) {
+        await safeResetPending(phone);
+        metric("REMINDER_CANCELLED_AT_CONFIRM", { reqId, user_id: user.id, client: clientName });
+
+        twiml.message("Ok, no se envió ✅");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      if (!toPhone) {
+        await safeResetPending(phone);
+        metric("REMINDER_COPYPASTE_SHOWN", { reqId, user_id: user.id, client: clientName, tone });
+
         twiml.message(
-          `Te leo 👀\nPrueba:\n` +
-            `• "Juan me debe 8500 desde el 3 de mayo"\n` +
-            `• "¿Quién me debe?"\n` +
-            `• "Manda recordatorio a Juan"`
+          `No tengo el teléfono guardado.\n\n` +
+            `Copia y pega este mensaje al cliente:\n\n${msg}\n\n` +
+            `Para guardarlo: "Guarda teléfono de ${clientName} +52..." `
         );
-      })(),
-      WEBHOOK_TIMEOUT_MS,
-      "webhook_timeout"
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      // 4) Enviar WhatsApp vía Twilio (hardening)
+      try {
+        const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886",
+          to: toPhone,
+          body: msg,
+        });
+
+        metric("REMINDER_SENT", {
+          reqId,
+          user_id: user.id,
+          client: clientName,
+          tone,
+          to: toPhone,
+        });
+      } catch (err) {
+        console.error("❌ Twilio send error:", err);
+        metric("ERROR", {
+          reqId,
+          user_id: user.id,
+          stage: "twilio_send",
+          message: err?.message || "unknown",
+        });
+
+        await safeResetPending(phone);
+        twiml.message("⚠️ No pude enviar el mensaje en este momento. Intenta de nuevo en 1 minuto.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      await safeResetPending(phone);
+      twiml.message(`✅ Listo. Envié el recordatorio a *${clientName}*.`);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // 2) OPENAI PARSER
+    // =========================
+    const parsed = await parseMessage(body);
+    metric("INTENT", { reqId, user_id: user.id, intent: parsed.intent || "unknown" });
+
+    // =========================
+    // SAVE PHONE
+    // =========================
+    if (parsed.intent === "save_phone") {
+      const clientName = parsed.client_name;
+      const rawPhone = parsed.phone || body;
+
+      if (!clientName) {
+        twiml.message(`Dime el nombre y el teléfono. Ejemplo:\n"Guarda teléfono de Juan +5218331112222"`);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      let normalized = parsed.phone ? normalizePhoneToWhatsApp(parsed.phone) : null;
+      if (!normalized) {
+        const m = body.match(/(\+?\d[\d()\s-]{7,}\d)/);
+        if (m) normalized = normalizePhoneToWhatsApp(m[1]);
+      }
+
+      if (!normalized) {
+        twiml.message(`No pude leer el teléfono. Ejemplo:\n"Guarda teléfono de ${clientName} +5218331112222"`);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      await upsertClient(user.id, clientName);
+      await setClientPhone(user.id, clientName, normalized);
+
+      metric("PHONE_SAVED", {
+        reqId,
+        user_id: user.id,
+        client: clientName,
+        country_guess: normalized.includes("+52") ? "MX" : "OTHER",
+      });
+
+      twiml.message(`✅ Guardado.\n• Cliente: ${clientName}\n• Tel: ${normalized.replace("whatsapp:", "")}`);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // 3) LISTAR
+    // =========================
+    if (parsed.intent === "list_debts") {
+      const debts = await listPendingDebts(user.id);
+
+      metric("DEBTS_LISTED", { reqId, user_id: user.id, count: debts.length });
+
+      if (!debts.length) {
+        twiml.message("✅ No tienes deudas registradas por cobrar.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const lines = debts.map((d, i) => {
+        const amt = Number(d.amount_due || 0).toLocaleString("es-MX", {
+          style: "currency",
+          currency: "MXN",
+        });
+        const since = d.due_text ? ` (desde ${d.due_text})` : "";
+        return `${i + 1}) ${d.client_name}: ${amt}${since}`;
+      });
+
+      twiml.message("📌 Te deben:\n" + lines.join("\n"));
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // 4) AGREGAR DEUDA
+    // =========================
+    if (parsed.intent === "add_debt") {
+      const clientName = parsed.client_name || "Cliente";
+      let amount = parsed.amount_due;
+
+      if (!amount) {
+        const m = body.toLowerCase().match(/(\d+(?:[.,]\d+)?)\s*(k|mil)\b/);
+        if (m) {
+          const n = Number(m[1].replace(",", "."));
+          if (Number.isFinite(n)) amount = Math.round(n * 1000);
+        }
+      } else {
+        const hasK = /\b(k|mil)\b/i.test(body);
+        if (hasK && amount < 1000) amount = Math.round(amount * 1000);
+      }
+
+      if (/\b(k|mil)\b/i.test(body) && amount && amount < 1000) {
+        twiml.message(`¿Te refieres a $${amount} o $${amount * 1000}? Responde "${amount}" o "${amount}k".`);
+        metric("DEBT_AMOUNT_AMBIGUOUS", { reqId, user_id: user.id, client: clientName, amount_guess: amount });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      if (!amount) {
+        twiml.message(
+          `No pude identificar el monto. Ejemplos:\n` +
+            `• "Juan me debe 8500 desde el 3 de mayo"\n` +
+            `• "me deben 2k"\n` +
+            `• "Pedro quedó a deber 300"`
+        );
+        metric("DEBT_AMOUNT_MISSING", { reqId, user_id: user.id, client: clientName });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const since = parsed.since_text || null;
+
+      await upsertClient(user.id, clientName);
+
+      const debt = await addDebt(user.id, clientName, amount, since);
+
+      metric("DEBT_CREATED", {
+        reqId,
+        user_id: user.id,
+        client: clientName,
+        amount_due: Number(amount),
+        has_since: Boolean(since),
+      });
+
+      const amt = Number(debt.amount_due).toLocaleString("es-MX", {
+        style: "currency",
+        currency: "MXN",
+      });
+
+      twiml.message(
+        `Registrado ✅\n` +
+          `• Cliente: ${debt.client_name}\n` +
+          `• Monto: ${amt}\n` +
+          (debt.due_text ? `• Desde: ${debt.due_text}\n\n` : `\n`) +
+          `¿Quieres agregar otro o preguntar "¿Quién me debe?"`
+      );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // PRIORIZAR
+    // =========================
+    if (parsed.intent === "prioritize") {
+      const debts = await listPendingDebts(user.id);
+
+      metric("PRIORITIZE_USED", { reqId, user_id: user.id, pending_count: debts.length });
+
+      if (!debts.length) {
+        twiml.message("✅ No tienes deudas registradas por cobrar.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const ranked = debts
+        .map((d) => {
+          const days = estimateDays(d.due_text);
+          const score = Number(d.amount_due || 0) + days * 10;
+          return { ...d, score, days };
+        })
+        .sort((a, b) => b.score - a.score);
+
+      const top = ranked[0];
+
+      const amt = Number(top.amount_due || 0).toLocaleString("es-MX", {
+        style: "currency",
+        currency: "MXN",
+      });
+
+      twiml.message(
+        `📌 *Recomendación de cobranza*\n\n` +
+          `Cobra primero a *${top.client_name}* por *${amt}*` +
+          (top.due_text ? ` (desde ${top.due_text})` : "") +
+          `.\n` +
+          (top.days ? `Prioridad por atraso estimado: ~${top.days} días.` : "")
+      );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // PAGAR ÚLTIMA DEUDA DE UN CLIENTE
+    // =========================
+    if (parsed.intent === "mark_paid") {
+      const clientName = parsed.client_name;
+      if (!clientName) {
+        twiml.message(`¿De quién? Ejemplo: "Ya pagó Juan"`);
+        metric("PAID_MISSING_CLIENT", { reqId, user_id: user.id });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      const r = await markLatestDebtPaid(user.id, clientName);
+
+      if (!r) {
+        metric("DEBT_PAID_NOT_FOUND", { reqId, user_id: user.id, client: clientName });
+        twiml.message(`No encontré deudas pendientes de *${clientName}*.`);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      metric("DEBT_MARKED_PAID", { reqId, user_id: user.id, client: clientName });
+
+      twiml.message(`✅ Marcado como pagado: *${clientName}*`);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // RECORDATORIO (3 tonos fijos)
+    // =========================
+    if (parsed.intent === "remind") {
+      const clientName = parsed.client_name || null;
+      const amount = parsed.amount_due || null;
+
+      if (!clientName) {
+        twiml.message(`¿A quién le mando recordatorio? Ejemplo:\n"Manda recordatorio a Juan"`);
+        metric("REMINDER_MISSING_CLIENT", { reqId, user_id: user.id });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twiml.toString());
+      }
+
+      let toPhone = null;
+      const client = await findClientByName(user.id, clientName);
+      if (client?.phone) toPhone = client.phone;
+
+      await updateUser(phone, {
+        pending_action: "remind_choose_tone",
+        pending_payload: { clientName, amount, toPhone },
+      });
+
+      metric("REMINDER_FLOW_STARTED", {
+        reqId,
+        user_id: user.id,
+        client: clientName,
+        has_client_phone: Boolean(toPhone),
+      });
+
+      twiml.message(
+        `¿Qué tono quieres para el recordatorio a *${clientName}*?\n` +
+          `• amable\n• firme\n• urgente\n\n` +
+          `(O escribe "cancelar")`
+      );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // AYUDA
+    // =========================
+    if (parsed.intent === "help") {
+      metric("HELP_USED", { reqId, user_id: user.id });
+
+      twiml.message(
+        `Así te ayudo:\n` +
+          `1) "Juan me debe 8500 desde el 3 de mayo"\n` +
+          `2) "¿Quién me debe?"\n` +
+          `3) "¿A quién cobro primero?"\n` +
+          `4) "Guarda teléfono de Juan +521833..."\n` +
+          `5) "Manda recordatorio a Juan"\n` +
+          `\nTambién entiendo: "me deben 2k".`
+      );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twiml.toString());
+    }
+
+    // =========================
+    // DEFAULT
+    // =========================
+    metric("FALLBACK_DEFAULT", { reqId, user_id: user.id });
+
+    twiml.message(
+      `Te leo. Para avanzar rápido, prueba uno de estos:\n` +
+        `• "Juan me debe 8500 desde el 3 de mayo"\n` +
+        `• "¿Quién me debe?"\n` +
+        `• "¿A quién cobro primero?"\n` +
+        `• "Guarda teléfono de Juan +5218..."\n` +
+        `• "Manda recordatorio a Juan"\n` +
+        `• "ayuda"`
     );
 
+    metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
     return res.type("text/xml").send(twiml.toString());
   } catch (err) {
-    log("WEBHOOK_FATAL", { error: err.message });
-    twiml.message("⚠️ Tuve un problema temporal. Intenta de nuevo.");
+    console.error("❌ Webhook error:", err);
+
+    metric("ERROR", {
+      reqId: reqId || null,
+      stage: "webhook_catch",
+      message: err?.message || "unknown",
+    });
+
+    twiml.message("⚠️ Hubo un problema temporal. Intenta de nuevo en un momento.");
+    metric("RESPONSE_SENT", { reqId: reqId || null, ms: Date.now() - (startedAt || Date.now()) });
     return res.type("text/xml").send(twiml.toString());
   }
 });

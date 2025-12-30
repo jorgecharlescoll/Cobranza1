@@ -1,8 +1,6 @@
 // cron-reminders.js
-// Cron robusto para Render + Supabase pooler (Transaction 6543)
-// - Reintentos ante timeouts
-// - No truena el cron por fallas temporales
-// - Cierra pool siempre
+// Cron robusto + métricas por logs (FlowSense)
+// v-2025-12-29-CRON-METRICS
 
 require("dotenv").config();
 
@@ -16,7 +14,7 @@ const {
   DATABASE_URL,
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
-  TWILIO_WHATSAPP_FROM, // ej: "whatsapp:+14155238886"
+  TWILIO_WHATSAPP_FROM,
 } = process.env;
 
 if (!DATABASE_URL) throw new Error("DATABASE_URL is not set");
@@ -24,32 +22,45 @@ if (!TWILIO_ACCOUNT_SID) throw new Error("TWILIO_ACCOUNT_SID is not set");
 if (!TWILIO_AUTH_TOKEN) throw new Error("TWILIO_AUTH_TOKEN is not set");
 if (!TWILIO_WHATSAPP_FROM) throw new Error("TWILIO_WHATSAPP_FROM is not set");
 
-// Asegura sslmode=require
+// =========================
+// Helpers: logs + metrics
+// =========================
+function isoNow() {
+  return new Date().toISOString();
+}
+function dayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+function log(event, data = {}) {
+  console.log(`[${event}]`, JSON.stringify({ ts: isoNow(), ...data }));
+}
+function metric(event, data = {}) {
+  console.log(`[METRIC:${event}]`, JSON.stringify({ ts: isoNow(), ...data }));
+}
+
+// =========================
+// DB Pool
+// =========================
 const connectionString = DATABASE_URL.includes("sslmode=")
   ? DATABASE_URL
   : DATABASE_URL + (DATABASE_URL.includes("?") ? "&" : "?") + "sslmode=require";
 
-// =========================
-// PG Pool (más tolerante a latencia)
-// =========================
 const pool = new Pool({
   connectionString,
   ssl: {
     rejectUnauthorized: false,
     checkServerIdentity: () => undefined,
   },
-
-  // Cron: pocas conexiones
   max: 2,
-
-  // ⬆️ subimos tolerancia de conexión (clave)
-  connectionTimeoutMillis: 60000, // 60s
+  connectionTimeoutMillis: 60000,
   idleTimeoutMillis: 30000,
   keepAlive: true,
   family: 4,
 });
 
-pool.on("error", (err) => console.error("PG pool error:", err?.message || err));
+pool.on("error", (err) =>
+  log("PG_POOL_ERROR", { message: err?.message || String(err) })
+);
 
 const tw = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
@@ -67,9 +78,7 @@ async function withRetry(fn, tries = 3) {
       return await fn();
     } catch (e) {
       lastErr = e;
-      const msg = e?.message || String(e);
-      console.error(`Retry ${i}/${tries} failed:`, msg);
-      // backoff: 1s, 2s, 4s
+      log("RETRY_FAIL", { attempt: i, message: e?.message || String(e) });
       await sleep(1000 * Math.pow(2, i - 1));
     }
   }
@@ -77,8 +86,10 @@ async function withRetry(fn, tries = 3) {
 }
 
 function fmtMoneyMXN(n) {
-  const val = Number(n || 0);
-  return val.toLocaleString("es-MX", { style: "currency", currency: "MXN" });
+  return Number(n || 0).toLocaleString("es-MX", {
+    style: "currency",
+    currency: "MXN",
+  });
 }
 
 function asWhatsApp(toPhone) {
@@ -99,6 +110,8 @@ async function sendWhatsApp(toPhone, body) {
 // 1) Recordatorios vencidos
 // =========================
 async function sendDueReminders(limit = 50) {
+  metric("CRON_DUE_REMINDERS_START", { limit });
+
   const { rows } = await withRetry(
     () =>
       pool.query(
@@ -115,12 +128,12 @@ async function sendDueReminders(limit = 50) {
     3
   );
 
-  if (!rows.length) {
-    console.log("No due reminders.");
-    return 0;
-  }
+  metric("CRON_DUE_REMINDERS_FOUND", { count: rows.length });
+
+  if (!rows.length) return { sent: 0, failed: 0 };
 
   let sent = 0;
+  let failed = 0;
 
   for (const r of rows) {
     try {
@@ -128,52 +141,65 @@ async function sendDueReminders(limit = 50) {
       await withRetry(
         () =>
           pool.query(
-            `update public.reminders
-             set status = 'sent', sent_at = now()
-             where id = $1`,
+            `
+            update public.reminders
+            set status = 'sent', sent_at = now()
+            where id = $1
+            `,
             [r.id]
           ),
         2
       );
+
       sent += 1;
+      metric("CRON_REMINDER_SENT", { reminder_id: r.id, user_id: r.user_id });
     } catch (err) {
-      console.error("Failed reminder id:", r.id, err?.message || err);
+      failed += 1;
+      log("CRON_REMINDER_FAILED", {
+        reminder_id: r.id,
+        message: err?.message || String(err),
+      });
+
       try {
         await pool.query(
-          `update public.reminders
-           set status = 'failed'
-           where id = $1`,
+          `
+          update public.reminders
+          set status = 'failed'
+          where id = $1
+          `,
           [r.id]
         );
       } catch (_) {}
     }
   }
 
-  console.log(`Sent due reminders: ${sent}/${rows.length}`);
-  return sent;
+  metric("CRON_DUE_REMINDERS_DONE", { sent, failed });
+  return { sent, failed };
 }
 
 // =========================
 // 2) Resumen diario (dueños)
 // =========================
 async function sendDailyOwnerSummaries() {
+  metric("CRON_DAILY_SUMMARY_START", {});
+
   const { rows: users } = await withRetry(
     () =>
       pool.query(
-        `select id, phone
-         from public.users
-         where phone is not null and phone <> ''
-         order by id asc`
+        `
+        select id, phone
+        from public.users
+        where phone is not null and phone <> ''
+        order by id asc
+        `
       ),
     3
   );
 
-  if (!users.length) {
-    console.log("No users with phone.");
-    return 0;
-  }
+  metric("CRON_USERS_ELIGIBLE", { count: users.length });
 
   let sent = 0;
+  let skipped = 0;
 
   for (const u of users) {
     try {
@@ -192,7 +218,11 @@ async function sendDailyOwnerSummaries() {
         2
       );
 
-      if (!debts.length) continue;
+      if (!debts.length) {
+        skipped += 1;
+        metric("CRON_DAILY_SUMMARY_SKIPPED", { user_id: u.id });
+        continue;
+      }
 
       const top = debts.slice(0, 5);
       const extra = Math.max(0, debts.length - top.length);
@@ -206,54 +236,67 @@ async function sendDailyOwnerSummaries() {
 
       const msg =
         `📌 *Recordatorio de cobranza (hoy)*\n\n` +
-        `Tengo estas deudas pendientes que conviene revisar:\n` +
+        `Tengo estas deudas pendientes:\n` +
         `${lines.join("\n")}\n\n` +
         (extra ? `(+${extra} más pendientes)\n\n` : "") +
-        `Responde aquí con uno de estos:\n` +
+        `Responde aquí con:\n` +
         `• "¿A quién cobro primero?"\n` +
         `• "Manda recordatorio a {Nombre}"\n` +
         `• "¿Quién me debe?"`;
 
       await sendWhatsApp(u.phone, msg);
       sent += 1;
+
+      metric("CRON_DAILY_SUMMARY_SENT", {
+        user_id: u.id,
+        debt_count: debts.length,
+      });
     } catch (err) {
-      console.error("Failed daily summary for user:", u.id, err?.message || err);
-      // NO tronamos todo el cron por un usuario
+      log("CRON_DAILY_SUMMARY_FAILED", {
+        user_id: u.id,
+        message: err?.message || String(err),
+      });
     }
   }
 
-  console.log(`Daily summaries sent: ${sent}/${users.length}`);
-  return sent;
+  metric("CRON_DAILY_SUMMARY_DONE", { sent, skipped });
+  return { sent, skipped };
 }
 
 // =========================
-// MAIN (NO truena por fallas temporales)
+// MAIN
 // =========================
 async function main() {
-  console.log("Cron start:", new Date().toISOString());
+  const startedAt = Date.now();
+  metric("CRON_RUN_START", { day: dayKey() });
 
-  let r1 = 0,
-    r2 = 0;
+  let r1 = { sent: 0, failed: 0 };
+  let r2 = { sent: 0, skipped: 0 };
 
   try {
     r1 = await sendDueReminders(80);
   } catch (e) {
-    console.error("sendDueReminders failed:", e?.message || e);
+    log("CRON_DUE_REMINDERS_FATAL", { message: e?.message || String(e) });
   }
 
   try {
     r2 = await sendDailyOwnerSummaries();
   } catch (e) {
-    console.error("sendDailyOwnerSummaries failed:", e?.message || e);
+    log("CRON_DAILY_SUMMARY_FATAL", { message: e?.message || String(e) });
   }
 
-  console.log("Cron done.", { dueRemindersSent: r1, dailySummariesSent: r2 });
+  metric("CRON_RUN_DONE", {
+    ms: Date.now() - startedAt,
+    due_sent: r1.sent,
+    due_failed: r1.failed,
+    summary_sent: r2.sent,
+    summary_skipped: r2.skipped,
+  });
 }
 
 main()
   .catch((err) => {
-    console.error("Cron fatal error:", err?.message || err);
-    // 👇 no hacemos exit(1); dejamos que termine “verde” si es posible
+    log("CRON_FATAL", { message: err?.message || String(err) });
   })
   .finally(async () => {
     try {
