@@ -1,553 +1,201 @@
-require("dotenv").config();
+// index.js — FlowSense (hardened production MVP)
+// v-2025-12-29-HARDENED-1
 
+require("dotenv").config();
 const express = require("express");
 const twilio = require("twilio");
+
+const { parseMessage } = require("./ai");
 
 const {
   getOrCreateUser,
   updateUser,
   addDebt,
   listPendingDebts,
-  createReminder,
-  listDueReminders,
-  markReminderSent,
-  markReminderFailed,
+  listDebtsByClient,
+  markLatestDebtPaid,
   findClientByName,
-  setClientPhone,
   upsertClient,
+  setClientPhone,
 } = require("./db");
-
-const { parseMessage } = require("./ai");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const VERSION = "v-2025-12-27-FINAL";
-app.get("/health", (_, res) => res.send(`ok ${VERSION}`));
+const VERSION = "v-2025-12-29-HARDENED-1";
 
-function nextWeekdayDate(targetDow, hour = 10) {
-  const now = new Date();
-  const d = new Date(now);
-  d.setHours(hour, 0, 0, 0);
-  const current = d.getDay(); // 0=dom,1=lun,...6=sab
-  let add = (targetDow - current + 7) % 7;
-  if (add === 0 && d <= now) add = 7;
-  d.setDate(d.getDate() + add);
-  return d;
+/* =========================
+   CONFIG HARDENING
+========================= */
+const WEBHOOK_TIMEOUT_MS = 8000;
+const PARSE_TIMEOUT_MS = 3500;
+
+/* =========================
+   HELPERS
+========================= */
+function withTimeout(promise, ms, label = "timeout") {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(label)), ms)
+    ),
+  ]);
 }
 
-function parseWhen(text, defaultHour = 10) {
-  const t = (text || "").toLowerCase();
-  const now = new Date();
-  const base = new Date(now);
+function normalizePhoneToWhatsApp(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim();
 
-  if (t.includes("mañana")) {
-    base.setDate(base.getDate() + 1);
-    base.setHours(defaultHour, 0, 0, 0);
-    return base;
+  if (s.toLowerCase().startsWith("whatsapp:")) {
+    const num = s.slice("whatsapp:".length).trim();
+    return "whatsapp:" + normalizePhoneToWhatsApp(num).replace("whatsapp:", "");
   }
 
-  if (t.includes("hoy")) {
-    base.setHours(defaultHour, 0, 0, 0);
-    if (base <= now) base.setHours(now.getHours() + 1, 0, 0, 0);
-    return base;
-  }
-
-  const m = t.match(/en\s+(\d+)\s+d[ií]as?/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    base.setDate(base.getDate() + (Number.isFinite(n) ? n : 1));
-    base.setHours(defaultHour, 0, 0, 0);
-    return base;
-  }
-
-  if (t.includes("lunes")) return nextWeekdayDate(1, defaultHour);
-  if (t.includes("martes")) return nextWeekdayDate(2, defaultHour);
-  if (t.includes("miércoles") || t.includes("miercoles"))
-    return nextWeekdayDate(3, defaultHour);
-  if (t.includes("jueves")) return nextWeekdayDate(4, defaultHour);
-  if (t.includes("viernes")) return nextWeekdayDate(5, defaultHour);
-  if (t.includes("sábado") || t.includes("sabado"))
-    return nextWeekdayDate(6, defaultHour);
-  if (t.includes("domingo")) return nextWeekdayDate(0, defaultHour);
-
-  const fallback = new Date(now);
-  fallback.setHours(now.getHours() + 2, 0, 0, 0);
-  return fallback;
-}
-
-function buildReminderText({ clientName, amount, tone }) {
-  const amtTxt = amount
-    ? ` por ${Number(amount).toLocaleString("es-MX", {
-        style: "currency",
-        currency: "MXN",
-      })}`
-    : "";
-
-  const name = clientName || "tu cliente";
-
-  if (tone === "amable") {
-    return `Hola ${name} 👋 Solo para recordarte el pago pendiente${amtTxt}. ¿Me ayudas con la fecha en la que podrás liquidarlo? Gracias 🙏`;
-  }
-  if (tone === "firme") {
-    return `Hola ${name}. Te escribo para dar seguimiento al pago pendiente${amtTxt}. ¿Podrías confirmarme cuándo lo liquidarás?`;
-  }
-  // urgente
-  return `Hola ${name}. Seguimos pendientes con el pago${amtTxt}. Necesito que hoy me confirmes si podrás liquidarlo o acordar una fecha exacta.`;
-}
-
-function estimateDays(dueText) {
-  if (!dueText) return 0;
-  const t = String(dueText).toLowerCase();
-
-  if (t.includes("año")) return 365;
-  if (t.includes("mes")) return 30;
-  if (t.includes("semana")) return 7;
-
-  const m = t.match(/(\d+)\s*(año|anos|años|mes|meses|semana|semanas)/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    const unit = m[2];
-    if (!Number.isFinite(n)) return 0;
-    if (unit.startsWith("a")) return n * 365;
-    if (unit.startsWith("mes")) return n * 30;
-    if (unit.startsWith("sem")) return n * 7;
-  }
-
-  return 0;
-}
-
-// =========================
-// Helpers WhatsApp
-// =========================
-function normalizeWhatsAppTo(input) {
-  if (!input) return null;
-  let s = String(input).trim();
-
-  // quitar espacios, guiones, paréntesis
+  s = s.replace(/[()\s-]/g, "");
+  const hasPlus = s.startsWith("+");
   s = s.replace(/[^\d+]/g, "");
+  if (!s) return null;
 
-  // si empieza con 52... sin +, lo agregamos
-  if (/^52\d+/.test(s)) s = "+" + s;
-
-  // si no empieza con +, intentamos agregarlo
-  if (!s.startsWith("+")) s = "+" + s;
+  if (!hasPlus) {
+    if (s.startsWith("52")) s = "+" + s;
+    else if (s.length === 10) s = "+52" + s;
+    else s = "+" + s;
+  }
 
   return `whatsapp:${s}`;
 }
 
+function normalizeText(s) {
+  return String(s || "").trim().replace(/\s+/g, " ");
+}
+
+function isYes(text) {
+  const t = normalizeText(text).toLowerCase();
+  return ["si", "sí", "simon", "ok", "dale", "enviar", "manda", "confirmo"].includes(t);
+}
+
+function isNo(text) {
+  const t = normalizeText(text).toLowerCase();
+  return ["no", "cancelar", "cancela", "alto", "detener"].includes(t);
+}
+
+function log(event, data = {}) {
+  console.log(`[${event}]`, JSON.stringify(data));
+}
+
+async function safeResetPending(phone) {
+  try {
+    await updateUser(phone, { pending_action: null, pending_payload: null });
+  } catch (_) {}
+}
+
+/* =========================
+   HEALTH
+========================= */
+app.get("/health", (_, res) => res.send(`ok ${VERSION}`));
+
+/* =========================
+   WEBHOOK
+========================= */
 app.post("/webhook/whatsapp", async (req, res) => {
+  const MessagingResponse = twilio.twiml.MessagingResponse;
+  const twiml = new MessagingResponse();
+
   const from = req.body.From;
-  const body = (req.body.Body || "").trim();
-  const twiml = new twilio.twiml.MessagingResponse();
+  const body = String(req.body.Body || "").trim();
+
+  log("INCOMING", { from, body });
 
   try {
-    console.log("Incoming:", { from, body });
+    await withTimeout(
+      (async () => {
+        const phone = from;
+        const user = await getOrCreateUser(phone);
 
-    const phone = from || "whatsapp:unknown";
-    const user = await getOrCreateUser(phone);
-
-    // =========================
-    // ESTADOS: recordatorio guiado (3 tonos fijos)
-    // =========================
-    if (user.pending_action === "remind_choose_tone") {
-      const tone = body.trim().toLowerCase();
-      const allowed = ["amable", "firme", "urgente", "cancelar"];
-
-      if (!allowed.includes(tone)) {
-        twiml.message(`Elige un tono: amable / firme / urgente (o "cancelar")`);
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      if (tone === "cancelar") {
-        await updateUser(phone, { pending_action: null, pending_payload: null });
-        twiml.message("Cancelado ✅");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const payload = user.pending_payload || {};
-      const clientName = payload.clientName || null;
-      const amount = payload.amount || null;
-      const toPhone = payload.toPhone || null;
-
-      const preview = buildReminderText({ clientName, amount, tone });
-
-      await updateUser(phone, {
-        pending_action: "remind_confirm_send",
-        pending_payload: { clientName, amount, tone, preview, toPhone },
-      });
-
-      twiml.message(
-        `📩 *Mensaje sugerido (${tone})*\n\n${preview}\n\n¿Lo envío ahora?\nResponde: "sí" o "cancelar"`
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    if (user.pending_action === "remind_confirm_send") {
-      const ans = body.trim().toLowerCase();
-      if (ans !== "sí" && ans !== "si" && ans !== "cancelar") {
-        twiml.message(`Responde "sí" para enviar o "cancelar" para abortar.`);
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      if (ans === "cancelar") {
-        await updateUser(phone, { pending_action: null, pending_payload: null });
-        twiml.message("Cancelado ✅");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const payload = user.pending_payload || {};
-      const clientName = payload.clientName || null;
-      const preview = payload.preview || "";
-      const toPhone = payload.toPhone || null;
-
-      // Si no hay teléfono guardado → copy/paste
-      if (!toPhone) {
-        await updateUser(phone, { pending_action: null, pending_payload: null });
-        twiml.message(
-          `✅ Listo. Aquí tienes el mensaje para enviar a *${
-            clientName || "tu cliente"
-          }*:\n\n${preview}`
-        );
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      // Envío automático
-      const accountSid = process.env.TWILIO_ACCOUNT_SID;
-      const authToken = process.env.TWILIO_AUTH_TOKEN;
-      const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-
-      if (!accountSid || !authToken) {
-        throw new Error(
-          "Missing Twilio env vars (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN)"
-        );
-      }
-
-      const twilioClient = twilio(accountSid, authToken);
-
-      await twilioClient.messages.create({
-        from: fromWa,
-        to: toPhone,
-        body: preview,
-      });
-
-      await updateUser(phone, { pending_action: null, pending_payload: null });
-
-      twiml.message(`✅ Enviado a *${clientName || "tu cliente"}* (${toPhone}).`);
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // =========================
-    // 1) REGLAS DIRECTAS
-    // =========================
-    if (/¿?\s*quién\s+me\s+debe\s*\??/i.test(body)) {
-      const debts = await listPendingDebts(user.id);
-
-      if (!debts.length) {
-        twiml.message("✅ No tienes deudas registradas por cobrar.");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const lines = debts.map((d, i) => {
-        const amt = Number(d.amount_due || 0).toLocaleString("es-MX", {
-          style: "currency",
-          currency: "MXN",
-        });
-        const since = d.due_text ? ` (desde ${d.due_text})` : "";
-        return `${i + 1}) ${d.client_name}: ${amt}${since}`;
-      });
-
-      twiml.message("📌 Te deben:\n" + lines.join("\n"));
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // =========================
-    // C1) GUARDAR TELÉFONO DE CLIENTE
-    // Ej: "Guarda teléfono de Juan +5218331112222"
-    // =========================
-    const mSave = body.match(
-      /guarda(?:r)?\s+(?:el\s+)?tel(?:e|é)fono\s+de\s+(.+?)\s+(\+?\d[\d\s-]{7,})$/i
-    );
-    if (mSave) {
-      const clientName = mSave[1].trim();
-      const rawPhone = mSave[2].trim();
-      const wa = normalizeWhatsAppTo(rawPhone);
-
-      const client = await findClientByName(user.id, clientName);
-      if (!client) {
-        twiml.message(
-          `No encontré al cliente "${clientName}". Primero registra una deuda, por ejemplo: "${clientName} me debe 500".`
-        );
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const updated = await setClientPhone(user.id, clientName, wa);
-      twiml.message(
-        `✅ Listo. Guardé el WhatsApp de *${updated.name}* como:\n${updated.phone}\n\nAhora puedes: "Manda recordatorio a ${updated.name}"`
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-// =========================
-// E1) MARCAR PAGADO (regla directa)
-// Ej: "Marcar pagado Federico", "Federico ya pagó", "Pagó Federico"
-// =========================
-const mPaid =
-  body.match(/^\s*marcar\s+pagad[oa]\s+(.+)\s*$/i) ||
-  body.match(/^\s*(.+?)\s+ya\s+pag[oó]\s*$/i) ||
-  body.match(/^\s*pag[oó]\s+(.+)\s*$/i);
-
-if (mPaid) {
-  const clientName = (mPaid[1] || "").trim();
-  if (!clientName) {
-    twiml.message(`¿De quién? Ej: "Marcar pagado Federico"`);
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  const paid = await markLatestDebtPaid(user.id, clientName);
-
-  if (!paid) {
-    twiml.message(
-      `No encontré una deuda *pendiente* para "${clientName}".\n` +
-      `Tip: prueba "¿Quién me debe?"`
-    );
-    return res.type("text/xml").send(twiml.toString());
-  }
-
-  const amt = Number(paid.amount_due || 0).toLocaleString("es-MX", {
-    style: "currency",
-    currency: "MXN",
-  });
-
-  twiml.message(`✅ Listo. Marqué como pagada la deuda de *${paid.client_name}* por *${amt}*.`);
-  return res.type("text/xml").send(twiml.toString());
-}
-
-
-    // =========================
-    // 2) OPENAI PARSER
-    // =========================
-    const parsed = await parseMessage(body);
-
-    // =========================
-    // 3) LISTAR
-    // =========================
-    if (parsed.intent === "list_debts") {
-      const debts = await listPendingDebts(user.id);
-
-      if (!debts.length) {
-        twiml.message("✅ No tienes deudas registradas por cobrar.");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const lines = debts.map((d, i) => {
-        const amt = Number(d.amount_due || 0).toLocaleString("es-MX", {
-          style: "currency",
-          currency: "MXN",
-        });
-        const since = d.due_text ? ` (desde ${d.due_text})` : "";
-        return `${i + 1}) ${d.client_name}: ${amt}${since}`;
-      });
-
-      twiml.message("📌 Te deben:\n" + lines.join("\n"));
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // =========================
-    // 4) AGREGAR DEUDA
-    // =========================
-    if (parsed.intent === "add_debt") {
-      const clientName = parsed.client_name || "Cliente";
-      let amount = parsed.amount_due;
-
-      // Normaliza montos tipo 2k / 2 mil
-      if (!amount) {
-        const m = body.toLowerCase().match(/(\d+(?:[.,]\d+)?)\s*(k|mil)\b/);
-        if (m) {
-          const n = Number(m[1].replace(",", "."));
-          if (Number.isFinite(n)) amount = Math.round(n * 1000);
+        if (!user.seen_onboarding) {
+          await updateUser(phone, { seen_onboarding: true });
+          twiml.message(
+            `👋 Soy FlowSense.\n\nPrueba:\n` +
+              `• "Juan me debe 8500 desde el 3 de mayo"\n` +
+              `• "¿Quién me debe?"\n` +
+              `• "¿A quién cobro primero?"\n` +
+              `• "Guarda teléfono de Juan +5218..."\n` +
+              `• "Manda recordatorio a Juan"`
+          );
+          return;
         }
-      } else {
-        const hasK = /\b(k|mil)\b/i.test(body);
-        if (hasK && amount < 1000) amount = Math.round(amount * 1000);
-      }
 
-      if (/\b(k|mil)\b/i.test(body) && amount && amount < 1000) {
-        twiml.message(
-          `¿Te refieres a $${amount} o $${amount * 1000}? Responde "${amount}" o "${amount}k".`
-        );
-        return res.type("text/xml").send(twiml.toString());
-      }
+        if (isNo(body)) {
+          await safeResetPending(phone);
+          twiml.message("Cancelado ✅");
+          return;
+        }
 
-      if (!amount) {
+        /* =========================
+           PARSER (timeout protegido)
+        ========================= */
+        let parsed;
+        try {
+          parsed = await withTimeout(
+            parseMessage(body),
+            PARSE_TIMEOUT_MS,
+            "parse_timeout"
+          );
+        } catch (err) {
+          log("PARSE_ERROR", { error: err.message });
+          twiml.message("⚠️ No te entendí bien. ¿Puedes intentar con otra frase?");
+          return;
+        }
+
+        log("INTENT", { intent: parsed.intent });
+
+        /* =========================
+           RECORDATORIO
+        ========================= */
+        if (parsed.intent === "remind") {
+          const clientName = parsed.client_name;
+          if (!clientName) {
+            twiml.message(`¿A quién? Ejemplo: "Manda recordatorio a Juan"`);
+            return;
+          }
+
+          let toPhone = null;
+          const client = await findClientByName(user.id, clientName);
+          if (client?.phone) toPhone = client.phone;
+
+          await updateUser(phone, {
+            pending_action: "remind_choose_tone",
+            pending_payload: { clientName, toPhone },
+          });
+
+          twiml.message(
+            `¿Qué tono quieres?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
+          );
+          return;
+        }
+
+        /* =========================
+           DEFAULT
+        ========================= */
         twiml.message(
-          `No pude identificar el monto. Ejemplos:\n` +
+          `Te leo 👀\nPrueba:\n` +
             `• "Juan me debe 8500 desde el 3 de mayo"\n` +
-            `• "me deben 2k"\n` +
-            `• "Pedro quedó a deber 300"`
+            `• "¿Quién me debe?"\n` +
+            `• "Manda recordatorio a Juan"`
         );
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const since = parsed.since_text || null;
-
-      // Asegura que exista el cliente en tabla clients
-      await upsertClient(user.id, clientName);
-
-      const debt = await addDebt(user.id, clientName, amount, since);
-      const amt = Number(debt.amount_due).toLocaleString("es-MX", {
-        style: "currency",
-        currency: "MXN",
-      });
-
-      twiml.message(
-        `Registrado ✅\n` +
-          `• Cliente: ${debt.client_name}\n` +
-          `• Monto: ${amt}\n` +
-          (debt.due_text ? `• Desde: ${debt.due_text}\n\n` : `\n`) +
-          `¿Quieres agregar otro o preguntar "¿Quién me debe?"`
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // =========================
-    // 5) PRIORIZAR
-    // =========================
-    if (parsed.intent === "prioritize") {
-      const debts = await listPendingDebts(user.id);
-
-      if (!debts.length) {
-        twiml.message("✅ No tienes deudas registradas por cobrar.");
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const ranked = debts
-        .map((d) => {
-          const days = estimateDays(d.due_text);
-          const score = Number(d.amount_due || 0) + days * 10;
-          return { ...d, score, days };
-        })
-        .sort((a, b) => b.score - a.score);
-
-      const top = ranked[0];
-
-      const amt = Number(top.amount_due || 0).toLocaleString("es-MX", {
-        style: "currency",
-        currency: "MXN",
-      });
-
-      twiml.message(
-        `📌 *Recomendación de cobranza*\n\n` +
-          `Cobra primero a *${top.client_name}* por *${amt}*` +
-          (top.due_text ? ` (desde ${top.due_text})` : "") +
-          `.\n` +
-          (top.days ? `Prioridad por atraso estimado: ~${top.days} días.` : "")
-      );
-
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // =========================
-    // C) INICIAR RECORDATORIO GUIADO (elige tono)
-    // =========================
-    if (parsed.intent === "remind") {
-      const clientName = parsed.client_name || null;
-      const amount = parsed.amount_due || null;
-
-      let toPhone = null;
-      if (clientName) {
-        const client = await findClientByName(user.id, clientName);
-        if (client?.phone) toPhone = client.phone;
-      }
-
-      await updateUser(phone, {
-        pending_action: "remind_choose_tone",
-        pending_payload: { clientName, amount, toPhone },
-      });
-
-      twiml.message(
-        `¿Qué tono quieres para el recordatorio${
-          clientName ? ` a *${clientName}*` : ""
-        }?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
-      );
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-   // =========================
-// 6) AYUDA
-// =========================
-if (parsed.intent === "help") {
-  twiml.message(
-    "Así te ayudo:\n" +
-      '1) "Juan me debe 8500 desde el 3 de mayo"\n' +
-      '2) "¿Quién me debe?"\n' +
-      '3) "¿A quién cobro primero?"\n' +
-      '4) "Guarda teléfono de Juan +5218..."\n' +
-      '5) "Manda recordatorio a Juan"\n' +
-      '\nTip: también entiendo "me deben 2k".'
-  );
-  return res.type("text/xml").send(twiml.toString());
-}
-
-    // =========================
-    // DEFAULT
-    // =========================
-    twiml.message(
-      `Te leo. Prueba:\n` +
-        `• "Juan me debe 8500 desde el 3 de mayo"\n` +
-        `• "¿Quién me debe?"\n` +
-        `• "¿A quién cobro primero?"\n` +
-        `• "Guarda teléfono de Juan +521833..."\n` +
-        `• "Manda recordatorio a Juan"`
+      })(),
+      WEBHOOK_TIMEOUT_MS,
+      "webhook_timeout"
     );
+
     return res.type("text/xml").send(twiml.toString());
   } catch (err) {
-    console.error("Webhook error:", err);
-    twiml.message("❌ Ocurrió un error. Revisa los logs del servidor.");
+    log("WEBHOOK_FATAL", { error: err.message });
+    twiml.message("⚠️ Tuve un problema temporal. Intenta de nuevo.");
     return res.type("text/xml").send(twiml.toString());
   }
 });
 
-app.get("/cron/reminders", async (req, res) => {
-  try {
-    if (!process.env.CRON_SECRET || req.query.key !== process.env.CRON_SECRET) {
-      return res.status(401).send("unauthorized");
-    }
-
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-
-    if (!accountSid || !authToken) {
-      return res.status(500).send("missing twilio env");
-    }
-
-    const client = twilio(accountSid, authToken);
-
-    const due = await listDueReminders(50);
-    let sent = 0;
-
-    for (const r of due) {
-      try {
-        await client.messages.create({
-          from: fromWa,
-          to: r.to_phone,
-          body: r.message,
-        });
-        await markReminderSent(r.id);
-        sent++;
-      } catch (e) {
-        console.error("Send reminder failed:", r.id, e?.message || e);
-        await markReminderFailed(r.id);
-      }
-    }
-
-    return res.send(`ok sent=${sent} due=${due.length}`);
-  } catch (err) {
-    console.error("Cron error:", err);
-    return res.status(500).send("error");
-  }
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running on port", process.env.PORT || 3000, "—", VERSION);
 });
-
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Server running on port", port, "—", VERSION));
