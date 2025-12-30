@@ -437,6 +437,9 @@ app.get("/stripe/cancel", (_, res) => res.status(200).send("Pago cancelado. Pued
 // -------------------------
 // Stripe Webhook (activación Pro automática)
 // -------------------------
+
+
+
 app.post("/webhook/stripe", async (req, res) => {
   if (!stripeReady()) return res.status(500).send("Stripe not configured");
 
@@ -454,13 +457,79 @@ app.post("/webhook/stripe", async (req, res) => {
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
-      const phone = session?.metadata?.phone;
+      const phone = session?.metadata?.phone; // viene como whatsapp:+52...
       const userId = session?.metadata?.user_id;
       const cycle = session?.metadata?.cycle || "mensual";
       const customerId = session.customer || null;
       const subscriptionId = session.subscription || null;
 
-      metric("STRIPE_CHECKOUT_COMPLETED", { user_id: userId || null, phone: phone || null, cycle, customerId, subscriptionId });
+      metric("STRIPE_CHECKOUT_COMPLETED", {
+        user_id: userId || null,
+        phone: phone || null,
+        cycle,
+        customerId,
+        subscriptionId,
+        event_id: event.id,
+      });
+
+      if (phone) {
+        // ✅ guard anti-duplicados (Stripe puede reintentar el evento)
+        const current = await getOrCreateUser(phone);
+        const alreadyPaid = String(current?.pro_lead_status || "").toLowerCase() === "paid" &&
+          String(current?.pro_source || "").toLowerCase() === "stripe";
+
+        if (!alreadyPaid) {
+          await updateUser(phone, {
+            plan: "pro",
+            pro_until: null,
+            pro_source: "stripe",
+            pro_started_at: isoNow(),
+            stripe_customer_id: customerId,
+            stripe_subscription_id: subscriptionId,
+            pro_lead_status: "paid",
+          });
+
+          metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId || null, cycle });
+
+          // ✅ Enviar confirmación por WhatsApp (Twilio outbound)
+          try {
+            const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+            const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+
+            const msg =
+              `✅ *Pago confirmado*\n\n` +
+              `Tu suscripción *FlowSense Pro* ya está activa.\n` +
+              `Plan: *${cycle}*\n\n` +
+              `Puedes seguir registrando deudas y enviando recordatorios sin límites.`;
+
+            await twilioClient.messages.create({
+              from: fromWa,
+              to: phone,
+              body: msg,
+            });
+
+            metric("WHATSAPP_PURCHASE_CONFIRM_SENT", { phone, user_id: userId || null, cycle });
+          } catch (err) {
+            console.error("❌ Twilio confirm send error:", err);
+            metric("ERROR", {
+              stage: "twilio_purchase_confirm",
+              message: err?.message || "unknown",
+              phone,
+            });
+          }
+        } else {
+          metric("STRIPE_EVENT_SKIPPED_ALREADY_PAID", { phone, user_id: userId || null, cycle, event_id: event.id });
+        }
+      }
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error("❌ Stripe webhook handler error:", err);
+    metric("ERROR", { stage: "stripe_webhook", message: err?.message || "unknown" });
+    return res.status(500).send("Webhook handler failed");
+  }
+});
 
       if (phone) {
         await updateUser(phone, {
