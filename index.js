@@ -1,5 +1,5 @@
-// index.js — FlowSense (Stripe + WhatsApp confirmation + PAGAR local)
-// v-2025-12-30-STRIPE-CONFIRM-FIX
+// index.js — FlowSense (Stripe lifecycle + WhatsApp confirmations)
+// v-2025-12-30-STRIPE-LIFECYCLE
 
 require("dotenv").config();
 const express = require("express");
@@ -19,7 +19,7 @@ const {
 } = require("./db");
 
 const app = express();
-const VERSION = "v-2025-12-30-STRIPE-CONFIRM-FIX";
+const VERSION = "v-2025-12-30-STRIPE-LIFECYCLE";
 
 // -------------------------
 // Stripe init
@@ -65,6 +65,14 @@ async function createCheckoutSessionForUser(user, cycle) {
       user_id: String(user.id),
       cycle: String(cycle || "mensual"),
     },
+    // ✅ Esto asegura que futuros eventos (invoice/subscription) traigan metadata
+    subscription_data: {
+      metadata: {
+        phone: user.phone,
+        user_id: String(user.id),
+        cycle: String(cycle || "mensual"),
+      },
+    },
     allow_promotion_codes: true,
   });
 
@@ -75,7 +83,7 @@ async function createCheckoutSessionForUser(user, cycle) {
 // Middlewares (IMPORTANT order)
 // -------------------------
 // Stripe webhook needs RAW body ONLY on that route:
-app.post("/webhook/stripe", express.raw({ type: "application/json" }));
+app.use("/webhook/stripe", express.raw({ type: "application/json" }));
 // WhatsApp webhook uses urlencoded:
 app.use(express.urlencoded({ extended: false }));
 
@@ -193,15 +201,53 @@ function addDaysISO(days) {
   return d.toISOString();
 }
 
+// ✅ Ahora Pro por Stripe depende del status/periodo/gracia
 function isPro(user) {
   if (!user) return false;
-  if (String(user.plan || "").toLowerCase() === "pro") return true;
-  if (user.pro_until) {
+
+  const plan = String(user.plan || "").toLowerCase();
+
+  // Trial-based Pro (or manual pro_until)
+  const proUntilOk = (() => {
+    if (!user.pro_until) return false;
     try {
       return new Date(user.pro_until).getTime() > Date.now();
-    } catch (_) {}
+    } catch (_) {
+      return false;
+    }
+  })();
+
+  if (plan !== "pro") return proUntilOk;
+
+  // If it's Pro via Stripe, trust Stripe status + period/grace
+  const source = String(user.pro_source || "").toLowerCase();
+  if (source === "stripe") {
+    const status = String(user.stripe_status || "").toLowerCase();
+
+    // Active/trialing => Pro
+    if (status === "active" || status === "trialing") return true;
+
+    // Past due/unpaid: allow if still within period end OR within grace (stored in pro_until)
+    const periodOk = (() => {
+      if (!user.stripe_current_period_end) return false;
+      try {
+        return new Date(user.stripe_current_period_end).getTime() > Date.now();
+      } catch (_) {
+        return false;
+      }
+    })();
+
+    if (status === "past_due" || status === "unpaid") return periodOk || proUntilOk;
+
+    // Canceled / expired / unknown => not Pro (unless grace)
+    if (status === "canceled" || status === "incomplete_expired") return proUntilOk;
+
+    // Default safe behavior: require either period/grace
+    return periodOk || proUntilOk;
   }
-  return false;
+
+  // Legacy behavior: plan says pro
+  return true;
 }
 
 async function ensureDailyCounter(user) {
@@ -360,9 +406,7 @@ app.get("/stripe/success", (_, res) => res.status(200).send("Pago recibido. Ya p
 app.get("/stripe/cancel", (_, res) => res.status(200).send("Pago cancelado. Puedes volver a WhatsApp y escribir PAGAR cuando gustes."));
 
 // -------------------------
-// Stripe Webhook (✅ async correcto + WhatsApp confirm)
-// IMPORTANT: This route MUST be defined with express.raw() body parsing.
-// We created a special app.post above to bind raw middleware, so here we define handler directly.
+// Stripe Webhook (Bloque 4)
 // -------------------------
 app.post("/webhook/stripe", async (req, res) => {
   if (!stripeReady()) return res.status(500).send("Stripe not configured");
@@ -377,7 +421,33 @@ app.post("/webhook/stripe", async (req, res) => {
     return res.status(400).send(`Webhook Error: ${err?.message}`);
   }
 
+  // Helper: get phone from subscription metadata (preferred)
+  const phoneFromSubscription = (sub) => {
+    const p = sub?.metadata?.phone || sub?.metadata?.whatsapp || null;
+    return p ? String(p) : null;
+  };
+
+  // Helper: normalize period end
+  const isoFromUnix = (unix) => {
+    if (!unix) return null;
+    try {
+      return new Date(Number(unix) * 1000).toISOString();
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // Helper: send WhatsApp message (best-effort)
+  const sendWhatsApp = async (to, text) => {
+    if (!to || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return false;
+    const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+    await twilioClient.messages.create({ from: fromWa, to, body: text });
+    return true;
+  };
+
   try {
+    // 1) Checkout completed (first-time purchase)
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
@@ -389,50 +459,228 @@ app.post("/webhook/stripe", async (req, res) => {
 
       metric("STRIPE_CHECKOUT_COMPLETED", { user_id: userId, phone, cycle, customerId, subscriptionId });
 
+      // Ensure the subscription has metadata for future invoice/subscription events
+      let sub = null;
+      if (subscriptionId) {
+        try {
+          await stripe.subscriptions.update(subscriptionId, {
+            metadata: { phone: String(phone || ""), user_id: String(userId || ""), cycle: String(cycle || "mensual") },
+          });
+          sub = await stripe.subscriptions.retrieve(subscriptionId);
+        } catch (err) {
+          console.error("❌ Stripe subscription metadata/update error:", err?.message || err);
+          metric("ERROR", { stage: "stripe_sub_update", message: err?.message || "unknown", subscriptionId });
+        }
+      }
+
+      const stripeStatus = sub?.status || "active";
+      const periodEnd = isoFromUnix(sub?.current_period_end) || null;
+
       if (phone) {
         const current = await getOrCreateUser(phone);
         const alreadyPaid =
           String(current?.pro_lead_status || "").toLowerCase() === "paid" &&
-          String(current?.pro_source || "").toLowerCase() === "stripe";
+          String(current?.pro_source || "").toLowerCase() === "stripe" &&
+          String(current?.stripe_subscription_id || "") === String(subscriptionId || "");
 
         if (!alreadyPaid) {
           await updateUser(phone, {
             plan: "pro",
-            pro_until: null,
             pro_source: "stripe",
+            pro_until: null, // Pro via Stripe is governed by Stripe status/period
             pro_started_at: isoNow(),
             stripe_customer_id: customerId,
             stripe_subscription_id: subscriptionId,
+            stripe_status: stripeStatus,
+            stripe_current_period_end: periodEnd,
             pro_lead_status: "paid",
           });
 
-          metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId, cycle });
+          metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId, cycle, stripe_status: stripeStatus });
 
-          // Send WhatsApp confirmation
+          // WhatsApp confirmation
           try {
-            const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-            const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-
             const msg =
               `✅ *Pago confirmado*\n\n` +
               `Tu suscripción *FlowSense Pro* ya está activa.\n` +
               `Plan: *${cycle}*\n\n` +
               `Ya puedes usar FlowSense sin límites.`;
-
-            await twilioClient.messages.create({
-              from: fromWa,
-              to: phone,
-              body: msg,
-            });
-
+            await sendWhatsApp(phone, msg);
             metric("WHATSAPP_PURCHASE_CONFIRM_SENT", { phone, user_id: userId, cycle });
           } catch (err) {
             console.error("❌ Twilio confirm send error:", err);
             metric("ERROR", { stage: "twilio_purchase_confirm", message: err?.message || "unknown", phone });
           }
         } else {
-          metric("STRIPE_EVENT_SKIPPED_ALREADY_PAID", { phone, user_id: userId, cycle });
+          metric("STRIPE_EVENT_SKIPPED_ALREADY_PAID", { phone, user_id: userId, cycle, event_id: event.id });
         }
+      } else {
+        metric("STRIPE_CHECKOUT_NO_PHONE", { user_id: userId, subscriptionId, event_id: event.id });
+      }
+    }
+
+    // 2) Recurring charge paid
+    if (event.type === "invoice.payment_succeeded") {
+      const invoice = event.data.object;
+      const subscriptionId = invoice.subscription || null;
+
+      let sub = null;
+      try {
+        if (subscriptionId) sub = await stripe.subscriptions.retrieve(subscriptionId);
+      } catch (err) {
+        console.error("❌ Stripe retrieve subscription error:", err?.message || err);
+      }
+
+      const phone = phoneFromSubscription(sub) || invoice?.lines?.data?.[0]?.metadata?.phone || null;
+      const stripeStatus = sub?.status || "active";
+      const periodEnd = isoFromUnix(sub?.current_period_end) || isoFromUnix(invoice?.lines?.data?.[0]?.period?.end) || null;
+
+      metric("STRIPE_INVOICE_PAID", {
+        subscriptionId,
+        phone,
+        stripe_status: stripeStatus,
+        period_end: periodEnd,
+        invoice_id: invoice.id,
+      });
+
+      if (phone) {
+        await updateUser(phone, {
+          plan: "pro",
+          pro_source: "stripe",
+          stripe_subscription_id: subscriptionId || null,
+          stripe_customer_id: invoice.customer || null,
+          stripe_status: stripeStatus,
+          stripe_current_period_end: periodEnd,
+          pro_until: null,
+        });
+
+        // Optional: WhatsApp receipt
+        try {
+          await sendWhatsApp(
+            phone,
+            `✅ *Pago recurrente confirmado*\n\nTu suscripción Pro sigue activa.\n` + (periodEnd ? `Vigente hasta: *${periodEnd.slice(0, 10)}*` : "")
+          );
+          metric("WHATSAPP_RENEWAL_CONFIRM_SENT", { phone, subscriptionId });
+        } catch (err) {
+          metric("ERROR", { stage: "twilio_renewal_confirm", message: err?.message || "unknown", phone });
+        }
+      } else {
+        metric("STRIPE_INVOICE_PAID_NO_PHONE", { subscriptionId, invoice_id: invoice.id });
+      }
+    }
+
+    // 3) Recurring charge failed (grace 3 days)
+    if (event.type === "invoice.payment_failed") {
+      const invoice = event.data.object;
+      const subscriptionId = invoice.subscription || null;
+
+      let sub = null;
+      try {
+        if (subscriptionId) sub = await stripe.subscriptions.retrieve(subscriptionId);
+      } catch (err) {
+        console.error("❌ Stripe retrieve subscription error:", err?.message || err);
+      }
+
+      const phone = phoneFromSubscription(sub) || invoice?.lines?.data?.[0]?.metadata?.phone || null;
+      const stripeStatus = sub?.status || "past_due";
+      const periodEnd = isoFromUnix(sub?.current_period_end) || isoFromUnix(invoice?.lines?.data?.[0]?.period?.end) || null;
+
+      const graceUntil = addDaysISO(3);
+
+      metric("STRIPE_INVOICE_FAILED", {
+        subscriptionId,
+        phone,
+        stripe_status: stripeStatus,
+        grace_until: graceUntil,
+        invoice_id: invoice.id,
+      });
+
+      if (phone) {
+        await updateUser(phone, {
+          stripe_status: stripeStatus,
+          stripe_current_period_end: periodEnd,
+          plan: "pro",
+          pro_source: "stripe",
+          pro_until: graceUntil,
+        });
+
+        try {
+          await sendWhatsApp(
+            phone,
+            `⚠️ *No se pudo cobrar tu suscripción Pro*\n\n` +
+              `Tienes *3 días* para actualizar tu método de pago.\n` +
+              `Si quieres reintentar el pago, escribe *PAGAR*.`
+          );
+          metric("WHATSAPP_PAYMENT_FAILED_SENT", { phone, subscriptionId });
+        } catch (err) {
+          metric("ERROR", { stage: "twilio_payment_failed", message: err?.message || "unknown", phone });
+        }
+      } else {
+        metric("STRIPE_INVOICE_FAILED_NO_PHONE", { subscriptionId, invoice_id: invoice.id });
+      }
+    }
+
+    // 4) Subscription canceled/deleted
+    if (event.type === "customer.subscription.deleted") {
+      const sub = event.data.object;
+      const subscriptionId = sub.id;
+      const phone = phoneFromSubscription(sub);
+
+      metric("STRIPE_SUBSCRIPTION_DELETED", { subscriptionId, phone, stripe_status: sub.status });
+
+      if (phone) {
+        await updateUser(phone, {
+          plan: "free",
+          pro_source: null,
+          pro_until: null,
+          stripe_status: "canceled",
+          stripe_current_period_end: isoFromUnix(sub.current_period_end) || null,
+        });
+
+        try {
+          await sendWhatsApp(
+            phone,
+            `📌 Tu suscripción *FlowSense Pro* fue cancelada.\n\n` +
+              `Puedes seguir usando el plan gratis (con límite diario).\n` +
+              `Para reactivar Pro: escribe *PAGAR*.`
+          );
+          metric("WHATSAPP_CANCELED_SENT", { phone, subscriptionId });
+        } catch (err) {
+          metric("ERROR", { stage: "twilio_canceled", message: err?.message || "unknown", phone });
+        }
+      } else {
+        metric("STRIPE_SUBSCRIPTION_DELETED_NO_PHONE", { subscriptionId });
+      }
+    }
+
+    // 5) Subscription updated (status changes, cancel_at_period_end, etc.)
+    if (event.type === "customer.subscription.updated") {
+      const sub = event.data.object;
+      const phone = phoneFromSubscription(sub);
+      const status = sub.status || null;
+      const periodEnd = isoFromUnix(sub.current_period_end) || null;
+      const cancelAtPeriodEnd = Boolean(sub.cancel_at_period_end);
+
+      metric("STRIPE_SUBSCRIPTION_UPDATED", {
+        subscriptionId: sub.id,
+        phone,
+        stripe_status: status,
+        period_end: periodEnd,
+        cancel_at_period_end: cancelAtPeriodEnd,
+      });
+
+      if (phone) {
+        const shouldBePro = status === "active" || status === "trialing" || status === "past_due" || status === "unpaid";
+        await updateUser(phone, {
+          plan: shouldBePro ? "pro" : "free",
+          pro_source: shouldBePro ? "stripe" : null,
+          stripe_status: status,
+          stripe_current_period_end: periodEnd,
+          // if cancel_at_period_end, allow access until period end
+          pro_until: cancelAtPeriodEnd && periodEnd ? periodEnd : null,
+        });
+      } else {
+        metric("STRIPE_SUBSCRIPTION_UPDATED_NO_PHONE", { subscriptionId: sub.id, stripe_status: status });
       }
     }
 
@@ -524,7 +772,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
           pending_payload: { ...payload, tone, msg },
         });
 
-        metric("REMINDER_PREVIEW", { reqId, user_id: user.id, tone, has_client_phone: Boolean(toPhone) });
+        metric("REMINDER_PREVIEW", { reqId, user_id: user.id, tone, has_client_phone: true });
 
         twimlResp.message(
           `📨 Este será el mensaje (${tone}):\n\n${msg}\n\n` +
@@ -650,9 +898,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // -------------------------
     // Intent parse (hard-guard PAGAR -> local -> OpenAI)
-    // -------------------------
     let parsed = null;
     if (normalizeText(body).toLowerCase() === "pagar") {
       parsed = { intent: "pay" };
