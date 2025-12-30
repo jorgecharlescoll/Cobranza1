@@ -1,5 +1,5 @@
-// index.js — FlowSense (clean production MVP + metrics logs)
-// v-2025-12-30-FINAL-METRICS-HOTFIX
+// index.js — FlowSense (clean production MVP + metrics logs + hotfix save_phone)
+// v-2025-12-30-HOTFIX-SAVEPHONE
 
 require("dotenv").config();
 const express = require("express");
@@ -22,7 +22,7 @@ const {
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 
-const VERSION = "v-2025-12-30-FINAL-METRICS-HOTFIX";
+const VERSION = "v-2025-12-30-HOTFIX-SAVEPHONE";
 
 // -------------------------
 // Logging + Metrics (logs only)
@@ -86,7 +86,6 @@ function isNo(text) {
 function looksLikeNewCommand(text) {
   const t = normalizeText(text).toLowerCase();
   if (!t) return false;
-  // cosas típicas de órdenes/consultas del bot
   return (
     t.includes("¿") ||
     t.includes("?") ||
@@ -95,13 +94,38 @@ function looksLikeNewCommand(text) {
     t.includes("cobro") ||
     t.includes("debe") ||
     t.includes("deuda") ||
-    t.includes("pag") || // pagó/pagar/pagado
+    t.includes("pag") ||
     t.includes("guarda") ||
     t.includes("telefono") ||
     t.includes("teléfono") ||
     t.includes("recordatorio") ||
     t.includes("manda")
   );
+}
+
+// ✅ NUEVO: Parser local para "Guarda teléfono de X +52..."
+function localParseSavePhone(body) {
+  const t = normalizeText(body);
+
+  // Acepta: telefono / teléfono, guarda / guardame / guarda el
+  // Ejemplos:
+  // "Guarda teléfono de Pepe +52833..."
+  // "Guarda el telefono de Pepe 833..."
+  // "Guarda telefono de Pepe: +52..."
+  const re = /^guarda(?:\s+el)?\s+tel(?:e|é)fono\s+de\s+(.+?)\s+(\+?\d[\d()\s-]{7,}\d)\s*$/i;
+  const m = t.match(re);
+  if (!m) return null;
+
+  const clientName = normalizeText(m[1]).replace(/[:\-]+$/, "").trim();
+  const phone = m[2];
+
+  if (!clientName || !phone) return null;
+
+  return {
+    intent: "save_phone",
+    client_name: clientName,
+    phone,
+  };
 }
 
 // Very simple estimator from Spanish "desde ..."
@@ -193,7 +217,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const reqId = makeReqId();
   const startedAt = Date.now();
 
-  logEvent("INCOMING", { ts: isoNow(), reqId, from, body });
+  logEvent("INCOMING", { reqId, from, body });
 
   try {
     const phone = from;
@@ -203,7 +227,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
     if (!user.seen_onboarding) {
       await updateUser(phone, { seen_onboarding: true });
-
       metric("ONBOARDING_SHOWN", { reqId, user_id: user.id });
 
       twiml.message(
@@ -236,7 +259,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
     if (user.pending_action === "remind_choose_tone") {
       const t = normalizeText(body).toLowerCase();
 
-      // Escape hatch
       if (looksLikeNewCommand(body) && !t.includes("amable") && !t.includes("firme") && !t.includes("urgente")) {
         await safeResetPending(phone);
         metric("PENDING_ABORTED_BY_NEW_COMMAND", { reqId, user_id: user.id, from_state: "remind_choose_tone" });
@@ -268,12 +290,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
           pending_payload: { ...payload, tone, msg },
         });
 
-        metric("REMINDER_PREVIEW", {
-          reqId,
-          user_id: user.id,
-          tone,
-          has_client_phone: Boolean(toPhone),
-        });
+        metric("REMINDER_PREVIEW", { reqId, user_id: user.id, tone, has_client_phone: Boolean(toPhone) });
 
         twiml.message(
           `📨 Este será el mensaje (${tone}):\n\n` +
@@ -289,7 +306,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
     }
 
     if (user.pending_action === "remind_confirm_send") {
-      // Escape hatch: si no es sí/no y parece otra orden, aborta pending
       if (!isYes(body) && !isNo(body) && looksLikeNewCommand(body)) {
         await safeResetPending(phone);
         metric("PENDING_ABORTED_BY_NEW_COMMAND", { reqId, user_id: user.id, from_state: "remind_confirm_send" });
@@ -346,12 +362,20 @@ app.post("/webhook/whatsapp", async (req, res) => {
     }
 
     // -------------------------
-    // Parser
+    // ✅ Router local antes de OpenAI
     // -------------------------
-    const parsed = await parseMessage(body);
-    metric("INTENT", { reqId, user_id: user.id, intent: parsed.intent || "unknown" });
+    let parsed = localParseSavePhone(body);
 
+    if (parsed) {
+      metric("INTENT", { reqId, user_id: user.id, intent: "save_phone", source: "local_regex" });
+    } else {
+      parsed = await parseMessage(body);
+      metric("INTENT", { reqId, user_id: user.id, intent: parsed.intent || "unknown", source: "openai" });
+    }
+
+    // =========================
     // SAVE PHONE
+    // =========================
     if (parsed.intent === "save_phone") {
       const clientName = parsed.client_name;
 
@@ -382,7 +406,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
     // LISTAR
+    // =========================
     if (parsed.intent === "list_debts") {
       const debts = await listPendingDebts(user.id);
       metric("DEBTS_LISTED", { reqId, user_id: user.id, count: debts.length });
@@ -404,7 +430,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
     // AGREGAR DEUDA
+    // =========================
     if (parsed.intent === "add_debt") {
       const clientName = parsed.client_name || "Cliente";
       let amount = parsed.amount_due;
@@ -458,7 +486,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
     // PRIORIZAR
+    // =========================
     if (parsed.intent === "prioritize") {
       const debts = await listPendingDebts(user.id);
       metric("PRIORITIZE_USED", { reqId, user_id: user.id, pending_count: debts.length });
@@ -491,7 +521,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
     // MARCAR PAGADO
+    // =========================
     if (parsed.intent === "mark_paid") {
       const clientName = parsed.client_name;
       if (!clientName) {
@@ -515,7 +547,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
     // RECORDATORIO
+    // =========================
     if (parsed.intent === "remind") {
       const clientName = parsed.client_name || null;
       const amount = parsed.amount_due || null;
@@ -547,7 +581,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twiml.toString());
     }
 
+    // =========================
     // HELP
+    // =========================
     if (parsed.intent === "help") {
       metric("HELP_USED", { reqId, user_id: user.id });
       twiml.message(
