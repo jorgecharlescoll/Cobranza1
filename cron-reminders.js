@@ -1,8 +1,9 @@
 // cron-reminders.js
 // Render Cron: Resumen diario + Downgrade automático (trial/stripe)
-// - Robusto ante fallas de DB
-// - Reintentos con backoff
-// - Cierra pool siempre
+// + Anti-duplicados con tabla notifications (dedupe por user_id + type + dedupe_key)
+//
+// Requisitos DB:
+// - public.notifications con unique(user_id, type, dedupe_key)
 
 require("dotenv").config();
 
@@ -73,8 +74,7 @@ async function queryWithRetry(text, params = [], tries = 3) {
     } catch (err) {
       lastErr = err;
       metric("CRON_DB_RETRY", { attempt: i + 1, message: err?.message || "unknown" });
-      // backoff: 1s, 2s, 4s
-      await sleep(1000 * Math.pow(2, i));
+      await sleep(1000 * Math.pow(2, i)); // 1s,2s,4s
     }
   }
   throw lastErr;
@@ -88,6 +88,31 @@ function buildAdminFilterSql(startIndex = 1) {
     params: [...ADMIN_PHONES],
     nextIndex: startIndex + ADMIN_PHONES.length,
   };
+}
+
+// =========================
+// Notifications (anti-duplicados)
+// =========================
+async function tryAcquireNotification({ user_id, phone, type, dedupe_key, meta = null }) {
+  // Inserta un registro único. Si ya existe: NO envíes.
+  // Devuelve true si “ganaste” el lock (se insertó), false si ya existía.
+  try {
+    const r = await queryWithRetry(
+      `
+      insert into public.notifications (user_id, phone, type, dedupe_key, meta)
+      values ($1, $2, $3, $4, $5)
+      on conflict (user_id, type, dedupe_key) do nothing
+      returning id
+      `,
+      [user_id, phone, type, dedupe_key, meta],
+      3
+    );
+    return (r.rows || []).length > 0;
+  } catch (err) {
+    // Si falla el lock, por seguridad NO mandamos para evitar duplicados
+    metric("ERROR", { stage: "notifications_tryAcquire", message: err?.message || "unknown", user_id, type, dedupe_key });
+    return false;
+  }
 }
 
 // =========================
@@ -108,14 +133,13 @@ async function sendWhatsApp(to, body) {
 }
 
 // =========================
-// 1) Downgrade automático
+// 1) Downgrade automático (anti-duplicados)
 // =========================
 async function downgradeExpiredPro() {
   // A) Trial expirado (plan=pro pero NO stripe, y pro_until ya pasó)
-  // Nota: también cubre casos donde pro_source es null/legacy
   const af = buildAdminFilterSql(1);
   const qTrial = `
-    select id, phone, pro_until, plan, pro_source
+    select id, phone, pro_until
     from users
     where plan = 'pro'
       and (pro_source is null or pro_source <> 'stripe')
@@ -124,6 +148,7 @@ async function downgradeExpiredPro() {
       ${af.sql}
     limit 200
   `;
+
   let rTrial = { rows: [] };
   try {
     rTrial = await queryWithRetry(qTrial, af.params, 3);
@@ -132,8 +157,23 @@ async function downgradeExpiredPro() {
   }
 
   let trialDowngraded = 0;
+
   for (const u of rTrial.rows) {
     try {
+      // Lock anti-duplicado: un downgrade de trial por día
+      const lock = await tryAcquireNotification({
+        user_id: u.id,
+        phone: u.phone,
+        type: "trial_expired_downgrade",
+        dedupe_key: dayKey(),
+        meta: { pro_until: u.pro_until },
+      });
+
+      if (!lock) {
+        metric("DEDUP_SKIPPED", { type: "trial_expired_downgrade", user_id: u.id, phone: u.phone });
+        continue;
+      }
+
       await queryWithRetry(
         `
         update users
@@ -149,17 +189,29 @@ async function downgradeExpiredPro() {
       trialDowngraded++;
       metric("PRO_DOWNGRADED_TRIAL_EXPIRED", { user_id: u.id, phone: u.phone });
 
-      // mensaje suave (best-effort)
-      try {
-        await sendWhatsApp(
-          u.phone,
-          `⏳ Tu prueba de *FlowSense Pro* terminó.\n\n` +
-            `Sigues en plan gratis (con límite diario).\n` +
-            `Para reactivar Pro: escribe *PAGAR*.`
-        );
-        metric("WHATSAPP_TRIAL_EXPIRED_SENT", { user_id: u.id, phone: u.phone });
-      } catch (err2) {
-        metric("ERROR", { stage: "twilio_trial_expired", message: err2?.message || "unknown", user_id: u.id });
+      // Mensaje WhatsApp (best-effort) con su propio dedupe (por día)
+      const msgLock = await tryAcquireNotification({
+        user_id: u.id,
+        phone: u.phone,
+        type: "whatsapp_trial_expired",
+        dedupe_key: dayKey(),
+        meta: null,
+      });
+
+      if (msgLock) {
+        try {
+          await sendWhatsApp(
+            u.phone,
+            `⏳ Tu prueba de *FlowSense Pro* terminó.\n\n` +
+              `Sigues en plan gratis (con límite diario).\n` +
+              `Para reactivar Pro: escribe *PAGAR*.`
+          );
+          metric("WHATSAPP_TRIAL_EXPIRED_SENT", { user_id: u.id, phone: u.phone });
+        } catch (err2) {
+          metric("ERROR", { stage: "twilio_trial_expired", message: err2?.message || "unknown", user_id: u.id });
+        }
+      } else {
+        metric("DEDUP_SKIPPED", { type: "whatsapp_trial_expired", user_id: u.id, phone: u.phone });
       }
     } catch (err) {
       metric("ERROR", { stage: "downgrade_trial_update", message: err?.message || "unknown", user_id: u.id });
@@ -167,13 +219,6 @@ async function downgradeExpiredPro() {
   }
 
   // B) Stripe no-activo y ya venció periodo/gracia
-  // Regla:
-  // - plan='pro' AND pro_source='stripe'
-  // - stripe_status NOT IN ('active','trialing')
-  // - y NO hay "pro_until" vigente
-  // - y stripe_current_period_end ya pasó (si existe)
-  //
-  // Si stripe_current_period_end es null, solo downgrade si pro_until también es null/expirado.
   const bf = buildAdminFilterSql(1);
   const qStripe = `
     select id, phone, stripe_status, stripe_current_period_end, pro_until
@@ -181,12 +226,8 @@ async function downgradeExpiredPro() {
     where plan='pro'
       and pro_source='stripe'
       and (coalesce(stripe_status,'') not in ('active','trialing'))
-      and (
-        (pro_until is null or pro_until < now())
-      )
-      and (
-        stripe_current_period_end is null or stripe_current_period_end < now()
-      )
+      and (pro_until is null or pro_until < now())
+      and (stripe_current_period_end is null or stripe_current_period_end < now())
       ${bf.sql}
     limit 200
   `;
@@ -199,8 +240,23 @@ async function downgradeExpiredPro() {
   }
 
   let stripeDowngraded = 0;
+
   for (const u of rStripe.rows) {
     try {
+      // Lock anti-duplicado: un downgrade stripe por día
+      const lock = await tryAcquireNotification({
+        user_id: u.id,
+        phone: u.phone,
+        type: "stripe_inactive_downgrade",
+        dedupe_key: dayKey(),
+        meta: { stripe_status: u.stripe_status, stripe_current_period_end: u.stripe_current_period_end },
+      });
+
+      if (!lock) {
+        metric("DEDUP_SKIPPED", { type: "stripe_inactive_downgrade", user_id: u.id, phone: u.phone });
+        continue;
+      }
+
       await queryWithRetry(
         `
         update users
@@ -220,17 +276,29 @@ async function downgradeExpiredPro() {
         stripe_status: u.stripe_status || null,
       });
 
-      // Mensaje WhatsApp best-effort
-      try {
-        await sendWhatsApp(
-          u.phone,
-          `📌 Tu suscripción *FlowSense Pro* ya no está activa.\n\n` +
-            `Cambie tu cuenta a plan gratis (con límite diario).\n` +
-            `Para reactivar Pro: escribe *PAGAR*.`
-        );
-        metric("WHATSAPP_STRIPE_DOWNGRADE_SENT", { user_id: u.id, phone: u.phone });
-      } catch (err2) {
-        metric("ERROR", { stage: "twilio_stripe_downgrade", message: err2?.message || "unknown", user_id: u.id });
+      // Mensaje WhatsApp (best-effort) con dedupe (por día)
+      const msgLock = await tryAcquireNotification({
+        user_id: u.id,
+        phone: u.phone,
+        type: "whatsapp_stripe_downgrade",
+        dedupe_key: dayKey(),
+        meta: null,
+      });
+
+      if (msgLock) {
+        try {
+          await sendWhatsApp(
+            u.phone,
+            `📌 Tu suscripción *FlowSense Pro* ya no está activa.\n\n` +
+              `Te pasé al plan gratis (con límite diario).\n` +
+              `Para reactivar Pro: escribe *PAGAR*.`
+          );
+          metric("WHATSAPP_STRIPE_DOWNGRADE_SENT", { user_id: u.id, phone: u.phone });
+        } catch (err2) {
+          metric("ERROR", { stage: "twilio_stripe_downgrade", message: err2?.message || "unknown", user_id: u.id });
+        }
+      } else {
+        metric("DEDUP_SKIPPED", { type: "whatsapp_stripe_downgrade", user_id: u.id, phone: u.phone });
       }
     } catch (err) {
       metric("ERROR", { stage: "downgrade_stripe_update", message: err?.message || "unknown", user_id: u.id });
@@ -242,12 +310,12 @@ async function downgradeExpiredPro() {
 }
 
 // =========================
-// 2) Resumen diario de deudas (ya lo tenías; lo dejo simple y robusto)
+// 2) Resumen diario de deudas (anti-duplicados)
 // =========================
 async function sendDailySummaries() {
   const f = buildAdminFilterSql(1);
 
-  // Selecciona usuarios con onboarding visto
+  // Usuarios con onboarding visto
   const qUsers = `
     select id, phone
     from users
@@ -270,6 +338,20 @@ async function sendDailySummaries() {
 
   for (const u of users) {
     try {
+      // Dedupe: 1 resumen diario por usuario por día
+      const lock = await tryAcquireNotification({
+        user_id: u.id,
+        phone: u.phone,
+        type: "daily_summary",
+        dedupe_key: dayKey(),
+        meta: null,
+      });
+
+      if (!lock) {
+        metric("DEDUP_SKIPPED", { type: "daily_summary", user_id: u.id, phone: u.phone });
+        continue;
+      }
+
       // Trae deudas pendientes
       const debtsR = await queryWithRetry(
         `
@@ -285,7 +367,11 @@ async function sendDailySummaries() {
       );
 
       const debts = debtsR.rows || [];
-      if (!debts.length) continue;
+      if (!debts.length) {
+        // No mandamos nada si no hay deudas; dejamos el lock puesto para no recalcular hoy
+        metric("DAILY_SUMMARY_SKIPPED_NO_DEBTS", { user_id: u.id, phone: u.phone });
+        continue;
+      }
 
       const top = debts.slice(0, 5);
       const extra = Math.max(0, debts.length - top.length);
@@ -304,12 +390,10 @@ async function sendDailySummaries() {
         (extra ? `\n…y ${extra} más.` : "") +
         `\n\nTip: escribe *¿A quién cobro primero?*`;
 
-      // Envía WhatsApp (best-effort)
       await sendWhatsApp(u.phone, msg);
       sent++;
       metric("DAILY_SUMMARY_SENT", { user_id: u.id, phone: u.phone, debt_count: debts.length });
 
-      // pequeño throttle para no saturar Twilio
       await sleep(200);
     } catch (err) {
       metric("ERROR", { stage: "daily_send_loop", message: err?.message || "unknown", user_id: u.id });
