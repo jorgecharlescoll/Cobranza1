@@ -1,5 +1,5 @@
-// index.js — FlowSense (FASE 1.3 Bloque 3 FIX: PAGAR local + Stripe + recordatorios + trial)
-// v-2025-12-30-STRIPE-FIX-PAGAR
+// index.js — FlowSense (Stripe + WhatsApp confirmation + PAGAR local)
+// v-2025-12-30-STRIPE-CONFIRM-FIX
 
 require("dotenv").config();
 const express = require("express");
@@ -7,7 +7,6 @@ const twilio = require("twilio");
 const Stripe = require("stripe");
 
 const { parseMessage } = require("./ai");
-
 const {
   getOrCreateUser,
   updateUser,
@@ -20,14 +19,7 @@ const {
 } = require("./db");
 
 const app = express();
-
-// IMPORTANT: Stripe webhook needs RAW body on its endpoint
-app.use("/webhook/stripe", express.raw({ type: "application/json" }));
-
-// WhatsApp webhook uses urlencoded (Twilio)
-app.use(express.urlencoded({ extended: false }));
-
-const VERSION = "v-2025-12-30-STRIPE-FIX-PAGAR";
+const VERSION = "v-2025-12-30-STRIPE-CONFIRM-FIX";
 
 // -------------------------
 // Stripe init
@@ -80,51 +72,12 @@ async function createCheckoutSessionForUser(user, cycle) {
 }
 
 // -------------------------
-// Comercial
+// Middlewares (IMPORTANT order)
 // -------------------------
-const LIMITS = { free_daily_actions: 15 };
-const TRIAL_DAYS_DEFAULT = 7;
-
-const BILLABLE_INTENTS = new Set([
-  "add_debt",
-  "list_debts",
-  "prioritize",
-  "remind",
-  "mark_paid",
-  "save_phone",
-]);
-
-const CTA_TEXT =
-  `🚀 *FlowSense Pro*\n` +
-  `• Ilimitado\n` +
-  `• Mejor seguimiento\n` +
-  `• Resumen diario\n\n` +
-  `Responde: *QUIERO PRO* o escribe: *PRECIO*`;
-
-function planText() {
-  return (
-    `💳 *Planes FlowSense*\n\n` +
-    `*Gratis*: hasta ${LIMITS.free_daily_actions} acciones al día.\n` +
-    `*Pro*: ilimitado.\n\n` +
-    `Para iniciar prueba: *QUIERO PRO*\n` +
-    `Para pagar: *PAGAR*`
-  );
-}
-
-// -------------------------
-// Admin phones
-// -------------------------
-function parseAdminPhones() {
-  const raw = process.env.ADMIN_PHONES || "";
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-const ADMIN_PHONES = parseAdminPhones();
-function isAdminPhone(from) {
-  return ADMIN_PHONES.includes(from);
-}
+// Stripe webhook needs RAW body ONLY on that route:
+app.post("/webhook/stripe", express.raw({ type: "application/json" }));
+// WhatsApp webhook uses urlencoded:
+app.use(express.urlencoded({ extended: false }));
 
 // -------------------------
 // Logging + Metrics
@@ -148,7 +101,6 @@ function metric(event, data = {}) {
 function normalizeText(s) {
   return String(s || "").trim().replace(/\s+/g, " ");
 }
-
 function normalizePhoneToWhatsApp(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
@@ -205,7 +157,117 @@ function looksLikeNewCommand(text) {
 }
 
 // -------------------------
-// Router local (crítico)
+// Comercial / Planes
+// -------------------------
+const LIMITS = { free_daily_actions: 15 };
+const TRIAL_DAYS_DEFAULT = 7;
+
+const BILLABLE_INTENTS = new Set([
+  "add_debt",
+  "list_debts",
+  "prioritize",
+  "remind",
+  "mark_paid",
+  "save_phone",
+]);
+
+const CTA_TEXT =
+  `🚀 *FlowSense Pro*\n` +
+  `• Ilimitado\n` +
+  `• Resumen diario\n\n` +
+  `Responde: *QUIERO PRO* o escribe: *PRECIO*`;
+
+function planText() {
+  return (
+    `💳 *Planes FlowSense*\n\n` +
+    `*Gratis*: hasta ${LIMITS.free_daily_actions} acciones al día.\n` +
+    `*Pro*: ilimitado.\n\n` +
+    `Para iniciar prueba: *QUIERO PRO*\n` +
+    `Para pagar: *PAGAR*`
+  );
+}
+
+function addDaysISO(days) {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString();
+}
+
+function isPro(user) {
+  if (!user) return false;
+  if (String(user.plan || "").toLowerCase() === "pro") return true;
+  if (user.pro_until) {
+    try {
+      return new Date(user.pro_until).getTime() > Date.now();
+    } catch (_) {}
+  }
+  return false;
+}
+
+async function ensureDailyCounter(user) {
+  const today = dayKey();
+  if (user.daily_count_day !== today) {
+    const updated = await updateUser(user.phone, {
+      daily_count_day: today,
+      daily_count: 0,
+    });
+    return updated || user;
+  }
+  return user;
+}
+
+async function incrementUsage(user, reqId, intent) {
+  if (!BILLABLE_INTENTS.has(intent)) return user;
+  if (isPro(user)) return user;
+
+  const next = (user.daily_count || 0) + 1;
+  const updated = await updateUser(user.phone, { daily_count: next });
+  metric("USAGE_INCREMENT", { reqId, user_id: user.id, intent, daily_count: next });
+  return updated || { ...user, daily_count: next };
+}
+
+function paywallMessage(user) {
+  const used = user.daily_count || 0;
+  const limit = LIMITS.free_daily_actions;
+  return `⚠️ Llegaste al límite gratuito de hoy (${used}/${limit}).\n\n${CTA_TEXT}`;
+}
+
+async function enforcePaywallIfNeeded({ user, reqId, intent, twiml }) {
+  if (!BILLABLE_INTENTS.has(intent)) return { blocked: false, user };
+
+  const u = await ensureDailyCounter(user);
+  if (isPro(u)) return { blocked: false, user: u };
+
+  const limit = LIMITS.free_daily_actions;
+  if ((u.daily_count || 0) >= limit) {
+    metric("PAYWALL_HIT", { reqId, user_id: u.id, intent, daily_count: u.daily_count, limit });
+    twiml.message(paywallMessage(u));
+    return { blocked: true, user: u };
+  }
+
+  const u2 = await incrementUsage(u, reqId, intent);
+  return { blocked: false, user: u2 };
+}
+
+// -------------------------
+// Recordatorios helpers
+// -------------------------
+function buildReminderMessage(tone, clientName, debtLine) {
+  const name = clientName || "hola";
+  const extra = debtLine ? `\n\n${debtLine}` : "";
+  if (tone === "firme") return `Hola ${name}.\nTe escribo para solicitar el pago pendiente. ¿Me confirmas hoy tu fecha y hora de pago?${extra}`;
+  if (tone === "urgente") return `Hola ${name}.\nEste es un recordatorio URGENTE del pago pendiente. Necesito confirmación inmediata de cuándo lo vas a cubrir.${extra}`;
+  return `Hola ${name} 👋\nTe escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?${extra}`;
+}
+
+async function safeResetPending(phone) {
+  try {
+    await updateUser(phone, { pending_action: null, pending_payload: null });
+  } catch (_) {}
+}
+
+// -------------------------
+// Router local (incluye PAGAR)
 // -------------------------
 function localParseSavePhone(body) {
   const t = normalizeText(body);
@@ -269,31 +331,13 @@ function localParseWantPro(body) {
   return null;
 }
 
-// ✅ FIX: PAGAR debe ser local (sin OpenAI)
 function localParsePay(body) {
   const t = normalizeText(body).toLowerCase();
-  if (t === "pagar") return { intent: "pay" };
-  // tolerante a variantes comunes
-  if (t === "pago" || t === "pagar pro" || t.includes("link de pago")) return { intent: "pay" };
+  if (t === "pagar" || t === "pago" || t === "pagar pro" || t.includes("link de pago")) return { intent: "pay" };
   return null;
 }
 
-// Admin: "ACTIVAR PRO 7"
-function localParseAdminActivatePro(body) {
-  const t = normalizeText(body).toLowerCase();
-  const m = t.match(/^activar\s+pro\s+(\d{1,3})\s*$/i);
-  if (!m) return null;
-  const days = Number(m[1]);
-  if (!Number.isFinite(days) || days <= 0 || days > 365) return null;
-  return { intent: "admin_activate_pro", days };
-}
-
-function localRouter(body, from) {
-  if (isAdminPhone(from)) {
-    const adminCmd = localParseAdminActivatePro(body);
-    if (adminCmd) return adminCmd;
-  }
-
+function localRouter(body) {
   return (
     localParseSavePhone(body) ||
     localParseMarkPaid(body) ||
@@ -303,143 +347,23 @@ function localRouter(body, from) {
     localParseHelp(body) ||
     localParsePrice(body) ||
     localParseWantPro(body) ||
-    localParsePay(body) || // ✅ FIX
+    localParsePay(body) ||
     null
   );
-}
-
-// -------------------------
-// Paywall helpers
-// -------------------------
-function isPro(user) {
-  if (!user) return false;
-  if (String(user.plan || "").toLowerCase() === "pro") return true;
-  if (user.pro_until) {
-    try {
-      return new Date(user.pro_until).getTime() > Date.now();
-    } catch (_) {}
-  }
-  return false;
-}
-
-function addDaysISO(days) {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString();
-}
-
-async function ensureDailyCounter(user) {
-  const today = dayKey();
-  if (user.daily_count_day !== today) {
-    const updated = await updateUser(user.phone, {
-      daily_count_day: today,
-      daily_count: 0,
-    });
-    return updated || user;
-  }
-  return user;
-}
-
-async function incrementUsage(user, reqId, intent) {
-  if (!BILLABLE_INTENTS.has(intent)) return user;
-  if (isPro(user)) return user;
-
-  const next = (user.daily_count || 0) + 1;
-  const updated = await updateUser(user.phone, { daily_count: next });
-  metric("USAGE_INCREMENT", { reqId, user_id: user.id, intent, daily_count: next });
-  return updated || { ...user, daily_count: next };
-}
-
-function paywallMessage(user) {
-  const used = user.daily_count || 0;
-  const limit = LIMITS.free_daily_actions;
-  return `⚠️ Llegaste al límite gratuito de hoy (${used}/${limit}).\n\n${CTA_TEXT}`;
-}
-
-async function enforcePaywallIfNeeded({ user, reqId, intent, twiml }) {
-  if (!BILLABLE_INTENTS.has(intent)) return { blocked: false, user };
-
-  const u = await ensureDailyCounter(user);
-  if (isPro(u)) return { blocked: false, user: u };
-
-  const limit = LIMITS.free_daily_actions;
-  if ((u.daily_count || 0) >= limit) {
-    metric("PAYWALL_HIT", { reqId, user_id: u.id, intent, daily_count: u.daily_count, limit });
-    twiml.message(paywallMessage(u));
-    return { blocked: true, user: u };
-  }
-
-  const u2 = await incrementUsage(u, reqId, intent);
-  return { blocked: false, user: u2 };
-}
-
-// -------------------------
-// Helpers negocio
-// -------------------------
-function estimateDays(dueText) {
-  if (!dueText) return 0;
-  const t = String(dueText).toLowerCase();
-  if (t.includes("hoy")) return 0;
-  if (t.includes("ayer")) return 1;
-
-  if (t.includes("semana")) {
-    const m = t.match(/(\d+)\s*seman/);
-    return m ? Number(m[1]) * 7 : 7;
-  }
-  if (t.includes("mes")) {
-    const m = t.match(/(\d+)\s*mes/);
-    return m ? Number(m[1]) * 30 : 30;
-  }
-
-  const months = [
-    ["enero", 30 * 11],
-    ["febrero", 30 * 10],
-    ["marzo", 30 * 9],
-    ["abril", 30 * 8],
-    ["mayo", 30 * 7],
-    ["junio", 30 * 6],
-    ["julio", 30 * 5],
-    ["agosto", 30 * 4],
-    ["septiembre", 30 * 3],
-    ["setiembre", 30 * 3],
-    ["octubre", 30 * 2],
-    ["noviembre", 30 * 1],
-    ["diciembre", 30 * 0],
-  ];
-  for (const [name, days] of months) {
-    if (t.includes(name)) return days || 15;
-  }
-  return 30;
-}
-
-function buildReminderMessage(tone, clientName, debtLine) {
-  const name = clientName || "hola";
-  const extra = debtLine ? `\n\n${debtLine}` : "";
-  if (tone === "firme") return `Hola ${name}.\nTe escribo para solicitar el pago pendiente. ¿Me confirmas hoy tu fecha y hora de pago?${extra}`;
-  if (tone === "urgente") return `Hola ${name}.\nEste es un recordatorio URGENTE del pago pendiente. Necesito confirmación inmediata de cuándo lo vas a cubrir.${extra}`;
-  return `Hola ${name} 👋\nTe escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?${extra}`;
-}
-
-async function safeResetPending(phone) {
-  try {
-    await updateUser(phone, { pending_action: null, pending_payload: null });
-  } catch (_) {}
 }
 
 // -------------------------
 // Routes (health + stripe success/cancel)
 // -------------------------
 app.get("/health", (_, res) => res.send(`ok ${VERSION}`));
-
 app.get("/stripe/success", (_, res) => res.status(200).send("Pago recibido. Ya puedes volver a WhatsApp."));
 app.get("/stripe/cancel", (_, res) => res.status(200).send("Pago cancelado. Puedes volver a WhatsApp y escribir PAGAR cuando gustes."));
 
 // -------------------------
-// Stripe Webhook (activación Pro automática)
+// Stripe Webhook (✅ async correcto + WhatsApp confirm)
+// IMPORTANT: This route MUST be defined with express.raw() body parsing.
+// We created a special app.post above to bind raw middleware, so here we define handler directly.
 // -------------------------
-
-
-
 app.post("/webhook/stripe", async (req, res) => {
   if (!stripeReady()) return res.status(500).send("Stripe not configured");
 
@@ -457,25 +381,18 @@ app.post("/webhook/stripe", async (req, res) => {
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
-      const phone = session?.metadata?.phone; // viene como whatsapp:+52...
-      const userId = session?.metadata?.user_id;
+      const phone = session?.metadata?.phone; // expects: whatsapp:+52...
+      const userId = session?.metadata?.user_id || null;
       const cycle = session?.metadata?.cycle || "mensual";
       const customerId = session.customer || null;
       const subscriptionId = session.subscription || null;
 
-      metric("STRIPE_CHECKOUT_COMPLETED", {
-        user_id: userId || null,
-        phone: phone || null,
-        cycle,
-        customerId,
-        subscriptionId,
-        event_id: event.id,
-      });
+      metric("STRIPE_CHECKOUT_COMPLETED", { user_id: userId, phone, cycle, customerId, subscriptionId });
 
       if (phone) {
-        // ✅ guard anti-duplicados (Stripe puede reintentar el evento)
         const current = await getOrCreateUser(phone);
-        const alreadyPaid = String(current?.pro_lead_status || "").toLowerCase() === "paid" &&
+        const alreadyPaid =
+          String(current?.pro_lead_status || "").toLowerCase() === "paid" &&
           String(current?.pro_source || "").toLowerCase() === "stripe";
 
         if (!alreadyPaid) {
@@ -489,9 +406,9 @@ app.post("/webhook/stripe", async (req, res) => {
             pro_lead_status: "paid",
           });
 
-          metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId || null, cycle });
+          metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId, cycle });
 
-          // ✅ Enviar confirmación por WhatsApp (Twilio outbound)
+          // Send WhatsApp confirmation
           try {
             const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
             const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
@@ -500,7 +417,7 @@ app.post("/webhook/stripe", async (req, res) => {
               `✅ *Pago confirmado*\n\n` +
               `Tu suscripción *FlowSense Pro* ya está activa.\n` +
               `Plan: *${cycle}*\n\n` +
-              `Puedes seguir registrando deudas y enviando recordatorios sin límites.`;
+              `Ya puedes usar FlowSense sin límites.`;
 
             await twilioClient.messages.create({
               from: fromWa,
@@ -508,40 +425,14 @@ app.post("/webhook/stripe", async (req, res) => {
               body: msg,
             });
 
-            metric("WHATSAPP_PURCHASE_CONFIRM_SENT", { phone, user_id: userId || null, cycle });
+            metric("WHATSAPP_PURCHASE_CONFIRM_SENT", { phone, user_id: userId, cycle });
           } catch (err) {
             console.error("❌ Twilio confirm send error:", err);
-            metric("ERROR", {
-              stage: "twilio_purchase_confirm",
-              message: err?.message || "unknown",
-              phone,
-            });
+            metric("ERROR", { stage: "twilio_purchase_confirm", message: err?.message || "unknown", phone });
           }
         } else {
-          metric("STRIPE_EVENT_SKIPPED_ALREADY_PAID", { phone, user_id: userId || null, cycle, event_id: event.id });
+          metric("STRIPE_EVENT_SKIPPED_ALREADY_PAID", { phone, user_id: userId, cycle });
         }
-      }
-    }
-
-    return res.json({ received: true });
-  } catch (err) {
-    console.error("❌ Stripe webhook handler error:", err);
-    metric("ERROR", { stage: "stripe_webhook", message: err?.message || "unknown" });
-    return res.status(500).send("Webhook handler failed");
-  }
-});
-
-      if (phone) {
-        await updateUser(phone, {
-          plan: "pro",
-          pro_until: null,
-          pro_source: "stripe",
-          pro_started_at: isoNow(),
-          stripe_customer_id: customerId,
-          stripe_subscription_id: subscriptionId,
-          pro_lead_status: "paid",
-        });
-        metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId || null, cycle });
       }
     }
 
@@ -558,7 +449,7 @@ app.post("/webhook/stripe", async (req, res) => {
 // -------------------------
 app.post("/webhook/whatsapp", async (req, res) => {
   const MessagingResponse = twilio.twiml.MessagingResponse;
-  const twiml = new MessagingResponse();
+  const twimlResp = new MessagingResponse();
 
   const from = req.body.From;
   const body = String(req.body.Body || "").trim();
@@ -577,7 +468,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     // onboarding
     if (!user.seen_onboarding) {
       await updateUser(phone, { seen_onboarding: true });
-      twiml.message(
+      twimlResp.message(
         `👋 Soy FlowSense.\n\n` +
           `Prueba:\n` +
           `• "Pepe me debe 9500 desde agosto"\n` +
@@ -588,20 +479,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
           `Tip: escribe *PRECIO*, *QUIERO PRO* o *PAGAR*.`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
     // cancelar
     if (isNo(body)) {
       await safeResetPending(phone);
-      twiml.message("Cancelado ✅");
+      twimlResp.message("Cancelado ✅");
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // ---------------------------------------------------
-    // Pending actions (recordatorios + flujo Pro)
-    // ---------------------------------------------------
+    // Pending: reminder tone
     if (user.pending_action === "remind_choose_tone") {
       const t = normalizeText(body).toLowerCase();
       if (looksLikeNewCommand(body) && !t.includes("amable") && !t.includes("firme") && !t.includes("urgente")) {
@@ -615,9 +504,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
         if (!tone) {
           metric("REMINDER_TONE_INVALID", { reqId, user_id: user.id, input: body });
-          twiml.message(`Responde con uno:\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`);
+          twimlResp.message(`Responde con uno:\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`);
           metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-          return res.type("text/xml").send(twiml.toString());
+          return res.type("text/xml").send(twimlResp.toString());
         }
 
         const payload = user.pending_payload || {};
@@ -637,15 +526,16 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
         metric("REMINDER_PREVIEW", { reqId, user_id: user.id, tone, has_client_phone: Boolean(toPhone) });
 
-        twiml.message(
+        twimlResp.message(
           `📨 Este será el mensaje (${tone}):\n\n${msg}\n\n` +
             (toPhone ? `¿Lo envío a ${toPhone}? Responde "sí" o "no".` : `No tengo el teléfono del cliente. ¿Quieres guardarlo primero?`)
         );
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
     }
 
+    // Pending: reminder confirm send
     if (user.pending_action === "remind_confirm_send") {
       if (!isYes(body) && !isNo(body) && looksLikeNewCommand(body)) {
         await safeResetPending(phone);
@@ -660,20 +550,20 @@ app.post("/webhook/whatsapp", async (req, res) => {
         if (!isYes(body)) {
           await safeResetPending(phone);
           metric("REMINDER_CANCELLED_AT_CONFIRM", { reqId, user_id: user.id, client: clientName });
-          twiml.message("Ok, no se envió ✅");
+          twimlResp.message("Ok, no se envió ✅");
           metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-          return res.type("text/xml").send(twiml.toString());
+          return res.type("text/xml").send(twimlResp.toString());
         }
 
         if (!toPhone) {
           await safeResetPending(phone);
           metric("REMINDER_COPYPASTE_SHOWN", { reqId, user_id: user.id, client: clientName, tone });
-          twiml.message(
+          twimlResp.message(
             `No tengo el teléfono guardado.\n\nCopia y pega este mensaje al cliente:\n\n${msg}\n\n` +
               `Para guardarlo: "Guarda teléfono de ${clientName} +52..."`
           );
           metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-          return res.type("text/xml").send(twiml.toString());
+          return res.type("text/xml").send(twimlResp.toString());
         }
 
         try {
@@ -688,19 +578,19 @@ app.post("/webhook/whatsapp", async (req, res) => {
           console.error("❌ Twilio send error:", err);
           metric("ERROR", { reqId, user_id: user.id, stage: "twilio_send", message: err?.message || "unknown" });
           await safeResetPending(phone);
-          twiml.message("⚠️ No pude enviar el mensaje en este momento. Intenta de nuevo en 1 minuto.");
+          twimlResp.message("⚠️ No pude enviar el mensaje en este momento. Intenta de nuevo en 1 minuto.");
           metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-          return res.type("text/xml").send(twiml.toString());
+          return res.type("text/xml").send(twimlResp.toString());
         }
 
         await safeResetPending(phone);
-        twiml.message(`✅ Listo. Envié el recordatorio a *${clientName}*.`);
+        twimlResp.message(`✅ Listo. Envié el recordatorio a *${clientName}*.`);
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
     }
 
-    // ---- Flujo Pro: pedir nombre/negocio
+    // Pending: Pro ask name
     if (user.pending_action === "pro_ask_name") {
       const name = normalizeText(body);
 
@@ -713,7 +603,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
       metric("PRO_LEAD_NAME", { reqId, user_id: user.id });
 
-      twiml.message(
+      twimlResp.message(
         `Gracias. ¿Qué prefieres?\n` +
           `1) *Mensual*\n` +
           `2) *Anual*\n\n` +
@@ -721,10 +611,10 @@ app.post("/webhook/whatsapp", async (req, res) => {
           `(Puedes escribir "cancelar")`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // ---- Flujo Pro: elegir ciclo y activar TRIAL
+    // Pending: Pro choose cycle -> start trial
     if (user.pending_action === "pro_ask_cycle") {
       const t = normalizeText(body).toLowerCase();
       let cycle = null;
@@ -732,10 +622,10 @@ app.post("/webhook/whatsapp", async (req, res) => {
       if (t.includes("anual")) cycle = "anual";
 
       if (!cycle) {
-        twiml.message(`Responde: "Mensual" o "Anual". (o "cancelar")`);
+        twimlResp.message(`Responde: "Mensual" o "Anual". (o "cancelar")`);
         metric("PRO_LEAD_CYCLE_INVALID", { reqId, user_id: user.id, input: body });
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       const proUntil = addDaysISO(TRIAL_DAYS_DEFAULT);
@@ -751,25 +641,24 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
       metric("PRO_TRIAL_STARTED", { reqId, user_id: user.id, days: TRIAL_DAYS_DEFAULT, cycle });
 
-      twiml.message(
+      twimlResp.message(
         `✅ Activé tu *FlowSense Pro* por *${TRIAL_DAYS_DEFAULT} días* (prueba).\n\n` +
           `Tu prueba vence: ${proUntil.slice(0, 10)}.\n` +
           `Para pagar y dejar Pro activo: escribe *PAGAR*`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
     // -------------------------
-    // Parse intent (local -> OpenAI)
+    // Intent parse (hard-guard PAGAR -> local -> OpenAI)
     // -------------------------
-    // ✅ Hard-guard extra para PAGAR (por si alguien rompe el router en el futuro)
+    let parsed = null;
     if (normalizeText(body).toLowerCase() === "pagar") {
+      parsed = { intent: "pay" };
       metric("INTENT", { reqId, user_id: user.id, intent: "pay", source: "hard_guard" });
-      // se maneja abajo como intent pay
-      var parsed = { intent: "pay" };
     } else {
-      var parsed = localRouter(body, from);
+      parsed = localRouter(body);
       if (parsed) metric("INTENT", { reqId, user_id: user.id, intent: parsed.intent, source: "local_router" });
       else {
         parsed = await parseMessage(body);
@@ -777,122 +666,86 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // -------------------------
-    // Admin activate Pro
-    // -------------------------
-    if (parsed.intent === "admin_activate_pro") {
-      if (!isAdminPhone(from)) {
-        twiml.message("No autorizado.");
-        metric("ADMIN_DENIED", { reqId, user_id: user.id });
-        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
-      }
-
-      const days = parsed.days;
-      const proUntil = addDaysISO(days);
-
-      await updateUser(phone, {
-        plan: "pro",
-        pro_until: proUntil,
-        pro_source: "admin",
-      });
-
-      metric("ADMIN_PRO_ACTIVATED", { reqId, user_id: user.id, days });
-
-      twiml.message(`✅ Pro activado por ${days} días.\nVence: ${proUntil.slice(0, 10)}`);
-      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
-    }
-
-    // -------------------------
     // Pricing / Want Pro / Pay
-    // -------------------------
     if (parsed.intent === "pricing") {
-      twiml.message(planText());
+      twimlResp.message(planText());
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
     if (parsed.intent === "want_pro") {
       await updateUser(phone, { pending_action: "pro_ask_name", pending_payload: { started_at: isoNow() } });
       metric("PRO_INTEREST", { reqId, user_id: user.id });
 
-      twiml.message(
+      twimlResp.message(
         `Perfecto. Para activar tu prueba *Pro* (${TRIAL_DAYS_DEFAULT} días), dime:\n\n` +
           `¿Cómo te llamas o cómo se llama tu negocio?\n` +
           `(Ej: "Tienda Pepe")`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
     if (parsed.intent === "pay") {
       if (!stripeReady()) {
         metric("PAY_NOT_CONFIGURED", { reqId, user_id: user.id });
-        twiml.message("⚠️ Pagos no configurados todavía. Revisa variables STRIPE_* en Render (Web Service).");
+        twimlResp.message("⚠️ Pagos no configurados todavía. Revisa variables STRIPE_* en Render (Web Service).");
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       const cycle = user.pro_lead_cycle || "mensual";
       const session = await createCheckoutSessionForUser(user, cycle);
 
       await updateUser(phone, { pro_lead_status: "payment_link_sent" });
-
       metric("PAY_LINK_CREATED", { reqId, user_id: user.id, cycle });
 
-      twiml.message(
+      twimlResp.message(
         `💳 Listo. Aquí está tu link de pago (*${cycle}*):\n\n` +
           `${session.url}\n\n` +
           `Cuando se complete, yo te activo Pro automáticamente ✅`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // -------------------------
-    // Paywall enforcement (antes de ejecutar intent)
-    // -------------------------
-    const gate = await enforcePaywallIfNeeded({ user, reqId, intent: parsed.intent, twiml });
+    // Paywall for billable intents
+    const gate = await enforcePaywallIfNeeded({ user, reqId, intent: parsed.intent, twiml: twimlResp });
     user = gate.user;
     if (gate.blocked) {
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // =========================
     // SAVE PHONE
-    // =========================
     if (parsed.intent === "save_phone") {
       const clientName = parsed.client_name;
       const normalized = normalizePhoneToWhatsApp(parsed.phone);
 
       if (!clientName || !normalized) {
-        twiml.message(`Ejemplo:\n"Guarda teléfono de Pepe +5218331112222"`);
+        twimlResp.message(`Ejemplo:\n"Guarda teléfono de Pepe +5218331112222"`);
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       await upsertClient(user.id, clientName);
       await setClientPhone(user.id, clientName, normalized);
 
       metric("PHONE_SAVED", { reqId, user_id: user.id, client: clientName });
-      twiml.message(`✅ Guardado.\n• Cliente: ${clientName}\n• Tel: ${normalized.replace("whatsapp:", "")}`);
+      twimlResp.message(`✅ Guardado.\n• Cliente: ${clientName}\n• Tel: ${normalized.replace("whatsapp:", "")}`);
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // =========================
     // LIST DEBTS
-    // =========================
     if (parsed.intent === "list_debts") {
       const debts = await listPendingDebts(user.id);
       metric("DEBTS_LISTED", { reqId, user_id: user.id, count: debts.length });
 
       if (!debts.length) {
-        twiml.message("✅ No tienes deudas registradas por cobrar.");
+        twimlResp.message("✅ No tienes deudas registradas por cobrar.");
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       const lines = debts.map((d, i) => {
@@ -901,23 +754,21 @@ app.post("/webhook/whatsapp", async (req, res) => {
         return `${i + 1}) ${d.client_name}: ${amt}${since}`;
       });
 
-      twiml.message("📌 Te deben:\n" + lines.join("\n"));
+      twimlResp.message("📌 Te deben:\n" + lines.join("\n"));
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // =========================
     // ADD DEBT
-    // =========================
     if (parsed.intent === "add_debt") {
       const clientName = parsed.client_name || "Cliente";
       const amount = parsed.amount_due;
 
       if (!amount) {
-        twiml.message(`No pude identificar el monto. Ejemplo: "Pepe me debe 9500 desde agosto"`);
+        twimlResp.message(`No pude identificar el monto. Ejemplo: "Pepe me debe 9500 desde agosto"`);
         metric("DEBT_AMOUNT_MISSING", { reqId, user_id: user.id, client: clientName });
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       const since = parsed.since_text || null;
@@ -927,84 +778,83 @@ app.post("/webhook/whatsapp", async (req, res) => {
       metric("DEBT_CREATED", { reqId, user_id: user.id, client: clientName, amount_due: Number(amount) });
 
       const amt = Number(debt.amount_due).toLocaleString("es-MX", { style: "currency", currency: "MXN" });
-      twiml.message(
+      twimlResp.message(
         `Registrado ✅\n• Cliente: ${debt.client_name}\n• Monto: ${amt}\n` +
           (debt.due_text ? `• Desde: ${debt.due_text}\n` : "") +
           `\n${CTA_TEXT}`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // =========================
     // PRIORITIZE
-    // =========================
     if (parsed.intent === "prioritize") {
       const debts = await listPendingDebts(user.id);
       metric("PRIORITIZE_USED", { reqId, user_id: user.id, pending_count: debts.length });
 
       if (!debts.length) {
-        twiml.message("✅ No tienes deudas registradas por cobrar.");
+        twimlResp.message("✅ No tienes deudas registradas por cobrar.");
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       const ranked = debts
         .map((d) => {
-          const days = estimateDays(d.due_text);
+          const t = String(d.due_text || "").toLowerCase();
+          let days = 30;
+          if (!t) days = 0;
+          else if (t.includes("ayer")) days = 1;
+          else if (t.includes("semana")) days = 7;
+          else if (t.includes("mes")) days = 30;
           const score = Number(d.amount_due || 0) + days * 10;
-          return { ...d, score, days };
+          return { ...d, score };
         })
         .sort((a, b) => b.score - a.score);
 
       const top = ranked[0];
       const amt = Number(top.amount_due || 0).toLocaleString("es-MX", { style: "currency", currency: "MXN" });
 
-      twiml.message(
+      twimlResp.message(
         `📌 *Recomendación de cobranza*\n\nCobra primero a *${top.client_name}* por *${amt}*` +
           (top.due_text ? ` (desde ${top.due_text})` : "") +
           `.\n\n${CTA_TEXT}`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // =========================
     // MARK PAID
-    // =========================
     if (parsed.intent === "mark_paid") {
       const clientName = parsed.client_name;
       if (!clientName) {
-        twiml.message(`¿De quién? Ejemplo: "Ya pagó Pepe"`);
+        twimlResp.message(`¿De quién? Ejemplo: "Ya pagó Pepe"`);
         metric("PAID_MISSING_CLIENT", { reqId, user_id: user.id });
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       const r = await markLatestDebtPaid(user.id, clientName);
       if (!r) {
         metric("DEBT_PAID_NOT_FOUND", { reqId, user_id: user.id, client: clientName });
-        twiml.message(`No encontré deudas pendientes de *${clientName}*.`);
+        twimlResp.message(`No encontré deudas pendientes de *${clientName}*.`);
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       metric("DEBT_MARKED_PAID", { reqId, user_id: user.id, client: clientName });
-      twiml.message(`✅ Marcado como pagado: *${clientName}*`);
+      twimlResp.message(`✅ Marcado como pagado: *${clientName}*`);
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // =========================
-    // REMIND (arranca flujo)
-    // =========================
+    // REMIND (start flow)
     if (parsed.intent === "remind") {
       const clientName = parsed.client_name || null;
       if (!clientName) {
-        twiml.message(`¿A quién le mando recordatorio? Ejemplo: "Manda recordatorio a Pepe"`);
+        twimlResp.message(`¿A quién le mando recordatorio? Ejemplo: "Manda recordatorio a Pepe"`);
         metric("REMINDER_MISSING_CLIENT", { reqId, user_id: user.id });
         metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-        return res.type("text/xml").send(twiml.toString());
+        return res.type("text/xml").send(twimlResp.toString());
       }
 
       let toPhone = null;
@@ -1018,14 +868,14 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
       metric("REMINDER_FLOW_STARTED", { reqId, user_id: user.id, client: clientName, has_client_phone: Boolean(toPhone) });
 
-      twiml.message(`¿Qué tono quieres para el recordatorio a *${clientName}*?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`);
+      twimlResp.message(`¿Qué tono quieres para el recordatorio a *${clientName}*?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`);
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
     // HELP
     if (parsed.intent === "help") {
-      twiml.message(
+      twimlResp.message(
         `Así te ayudo:\n` +
           `• "Pepe me debe 9500 desde agosto"\n` +
           `• "¿Quién me debe?"\n` +
@@ -1036,20 +886,20 @@ app.post("/webhook/whatsapp", async (req, res) => {
           `• "PAGAR"`
       );
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-      return res.type("text/xml").send(twiml.toString());
+      return res.type("text/xml").send(twimlResp.toString());
     }
 
     // fallback
-    twiml.message(`Te leo. Prueba:\n• "Pepe me debe 9500 desde agosto"\n• "¿Quién me debe?"\n• "PRECIO" / "PAGAR"`);
+    twimlResp.message(`Te leo. Prueba:\n• "Pepe me debe 9500 desde agosto"\n• "¿Quién me debe?"\n• "PRECIO" / "PAGAR"`);
     metric("FALLBACK_DEFAULT", { reqId, user_id: user.id });
     metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
-    return res.type("text/xml").send(twiml.toString());
+    return res.type("text/xml").send(twimlResp.toString());
   } catch (err) {
     console.error("❌ Webhook error:", err);
     metric("ERROR", { stage: "webhook_catch", message: err?.message || "unknown" });
-    twiml.message("⚠️ Hubo un problema temporal. Intenta de nuevo en un momento.");
+    twimlResp.message("⚠️ Hubo un problema temporal. Intenta de nuevo en un momento.");
     metric("RESPONSE_SENT", { ms: Date.now() - startedAt });
-    return res.type("text/xml").send(twiml.toString());
+    return res.type("text/xml").send(twimlResp.toString());
   }
 });
 
