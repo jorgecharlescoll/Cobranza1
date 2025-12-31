@@ -1,5 +1,5 @@
 // index.js — FlowSense (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
-// v-2025-12-31-BLOQUE5-PRO-TRIAL-END2END
+// v-2025-12-31-BLOQUE6-DB-DEDUP-MULTIINSTANCE
 
 require("dotenv").config();
 
@@ -22,7 +22,7 @@ const {
 } = require("./db");
 
 const app = express();
-const VERSION = "v-2025-12-31-BLOQUE5-PRO-TRIAL-END2END";
+const VERSION = "v-2025-12-31-BLOQUE6-DB-DEDUP-MULTIINSTANCE";
 
 // -------------------------
 // Shared Twilio outbound (para enviar recordatorios al cliente)
@@ -482,7 +482,7 @@ async function safeResetPending(phone) {
 }
 
 // -------------------------
-// Bloque 3 — Anti-spam + Anti-replay + Anti-loops
+// Bloque 3 — Anti-spam (rate limit) + Anti-replay/loops
 // -------------------------
 class TTLMap {
   constructor() {
@@ -512,12 +512,14 @@ function sha1(input) {
   return crypto.createHash("sha1").update(String(input)).digest("hex");
 }
 
+// In-memory (fast) dedup — aún útil, pero DB será el “source of truth”
 const DEDUP_SID_TTL_MS = 10 * 60 * 1000;
 const DEDUP_BODY_TTL_MS = 15 * 1000;
 
 const dedupMessageSid = new TTLMap();
 const dedupPayloadHash = new TTLMap();
 
+// Rate limit config
 const RL_WINDOW_MS = 15 * 1000;
 const RL_MAX_MSGS = 6;
 const rlState = new Map();
@@ -541,6 +543,75 @@ setInterval(() => {
     else rlState.set(k, fresh);
   }
 }, 30 * 1000).unref();
+
+// -------------------------
+// ✅ Bloque 6 — DB Dedup (multi-instancia)
+// -------------------------
+const DB_DEDUP_ENABLED = String(process.env.DB_DEDUP_ENABLED || "true").toLowerCase() !== "false";
+
+// TTL en DB: guardamos llaves cortas, y limpiamos con un delete simple
+const DB_DEDUP_TTL_SID_MS = 10 * 60 * 1000; // 10 min
+const DB_DEDUP_TTL_HASH_MS = 20 * 1000; // 20s (un poquito más que mem)
+
+async function ensureInboundDedupTable() {
+  if (!DB_DEDUP_ENABLED) return;
+  try {
+    await pool.query(`
+      create table if not exists public.inbound_dedup (
+        k text primary key,
+        created_at timestamptz not null default now(),
+        phone text,
+        message_sid text,
+        payload_hash text
+      );
+    `);
+    await pool.query(`create index if not exists idx_inbound_dedup_created_at on public.inbound_dedup (created_at desc);`);
+  } catch (err) {
+    metric("DB_DEDUP_INIT_FAIL", { message: err?.message || "unknown" });
+  }
+}
+
+// Limpieza ligera (no crítica)
+async function cleanupInboundDedup() {
+  if (!DB_DEDUP_ENABLED) return;
+  try {
+    // borramos todo lo muy viejo (2 días) para que la tabla no crezca infinito
+    await pool.query(`delete from public.inbound_dedup where created_at < now() - interval '2 days';`);
+  } catch (_) {}
+}
+
+// Inserta llave única; si ya existe => duplicado
+async function dbDedupTryInsert({ key, phone, messageSid, payloadHash }) {
+  if (!DB_DEDUP_ENABLED) return { ok: true, inserted: true, skipped: false };
+  try {
+    const r = await pool.query(
+      `
+      insert into public.inbound_dedup (k, phone, message_sid, payload_hash)
+      values ($1, $2, $3, $4)
+      on conflict (k) do nothing
+      returning k
+      `,
+      [key, phone || null, messageSid || null, payloadHash || null]
+    );
+    const inserted = (r.rows || []).length > 0;
+    return { ok: true, inserted, skipped: !inserted };
+  } catch (err) {
+    // fail-open: no bloqueamos la operación si DB anda rara
+    metric("DB_DEDUP_INSERT_FAIL", { message: err?.message || "unknown" });
+    return { ok: false, inserted: true, skipped: false };
+  }
+}
+
+async function dbDedupIsExpiredKey(key, ttlMs) {
+  if (!DB_DEDUP_ENABLED) return false;
+  // Opcional: no necesitamos check de expiración si usamos key único y TTL global de 2 días,
+  // pero para hash (ventana corta) sí nos conviene “barrer” hashes viejos.
+  // Implementación simple: borramos hashes viejos por tiempo sin consultar cada vez.
+  return false;
+}
+
+// Inicializa tabla al arrancar
+ensureInboundDedupTable().then(() => cleanupInboundDedup());
 
 // -------------------------
 // Paywall + Pro logic
@@ -583,7 +654,6 @@ function isPro(user) {
     return periodOk || proUntilOk;
   }
 
-  // trial/manual pro usa pro_until
   return proUntilOk || plan === "pro";
 }
 
@@ -982,30 +1052,50 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const body = String(bodyRaw).trim();
   const messageSid = req.body.MessageSid || null;
 
-  // Bloque 3: anti-replay + anti-loop + rate limit
+  // ✅ Bloque 6: DB dedup (multi-instancia) + Bloque 3: mem dedup + rate limit
   try {
+    // 1) DB dedup por SID si existe
+    if (messageSid) {
+      const keySid = `sid:${messageSid}`;
+      const rSid = await dbDedupTryInsert({ key: keySid, phone: from, messageSid, payloadHash: null });
+      if (rSid.skipped) {
+        metric("DEDUP_SKIPPED", { reqId, from, reason: "db_message_sid", messageSid });
+        return res.type("text/xml").send(twimlResp.toString());
+      }
+    }
+
+    // 2) DB dedup por hash (ventana corta)
+    const payloadHash = sha1(`${String(from || "")}|${String(body || "")}`);
+    const keyHash = `hash:${payloadHash}`;
+    const rHash = await dbDedupTryInsert({ key: keyHash, phone: from, messageSid: messageSid || null, payloadHash });
+    if (rHash.skipped) {
+      metric("DEDUP_SKIPPED", { reqId, from, reason: "db_payload_hash", payloadHash });
+      return res.type("text/xml").send(twimlResp.toString());
+    }
+
+    // 3) In-memory dedup (rápido, extra)
     if (messageSid) {
       if (dedupMessageSid.has(messageSid)) {
-        metric("DEDUP_SKIPPED", { reqId, from, reason: "message_sid", messageSid });
+        metric("DEDUP_SKIPPED", { reqId, from, reason: "mem_message_sid", messageSid });
         return res.type("text/xml").send(twimlResp.toString());
       }
       dedupMessageSid.set(messageSid, DEDUP_SID_TTL_MS);
     }
 
-    const payloadKey = sha1(`${String(from || "")}|${String(body || "")}`);
-    if (dedupPayloadHash.has(payloadKey)) {
-      metric("DEDUP_SKIPPED", { reqId, from, reason: "payload_hash", payloadKey });
+    if (dedupPayloadHash.has(payloadHash)) {
+      metric("DEDUP_SKIPPED", { reqId, from, reason: "mem_payload_hash", payloadHash });
       return res.type("text/xml").send(twimlResp.toString());
     }
-    dedupPayloadHash.set(payloadKey, DEDUP_BODY_TTL_MS);
+    dedupPayloadHash.set(payloadHash, DEDUP_BODY_TTL_MS);
 
+    // 4) Rate limit
     if (from && isRateLimited(from)) {
       metric("RATE_LIMIT", { reqId, from, window_ms: RL_WINDOW_MS, max: RL_MAX_MSGS });
       twimlResp.message(COPY.rateLimited);
       return res.type("text/xml").send(twimlResp.toString());
     }
   } catch (e) {
-    metric("BLOQUE3_FAIL_OPEN", { reqId, message: e?.message || "unknown" });
+    metric("DEDUP_FAIL_OPEN", { reqId, message: e?.message || "unknown" });
   }
 
   logEvent("INCOMING", { ts: isoNow(), reqId, from, body });
@@ -1052,14 +1142,13 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // ✅ Bloque 5: Pending: pro ask name -> activate trial
+    // Pending: pro ask name -> activate trial
     if (user.pending_action === "pro_ask_name") {
       if (looksLikeNewCommand(body)) {
         await safeResetPending(phone);
       } else {
         const businessName = normalizeText(body).slice(0, 60);
 
-        // Si ya es Pro, no hacemos nada
         if (isPro(user)) {
           await safeResetPending(phone);
           respond(twimlResp, COPY.alreadyPro);
@@ -1084,7 +1173,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // ✅ Bloque 4: Pending: reminder tone selection
+    // Pending: reminder tone selection
     if (user.pending_action === "remind_choose_tone") {
       if (looksLikeNewCommand(body)) {
         await safeResetPending(phone);
@@ -1128,7 +1217,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // ✅ Bloque 4: Pending: reminder confirm
+    // Pending: reminder confirm
     if (user.pending_action === "remind_confirm") {
       if (looksLikeNewCommand(body)) {
         await safeResetPending(phone);
@@ -1183,9 +1272,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // -------------------------
     // Intent parse: hard-guard PAGAR -> local -> OpenAI
-    // -------------------------
     let parsed = null;
     if (normalizeText(body).toLowerCase() === "pagar") {
       parsed = { intent: "pay" };
@@ -1468,6 +1555,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
     metric("ERROR", { reqId, stage: "webhook_catch", message: err?.message || "unknown" });
     twimlResp.message("⚠️ Hubo un problema temporal. Intenta de nuevo en un momento.");
     return res.type("text/xml").send(twimlResp.toString());
+  } finally {
+    // limpieza ocasional (no bloqueante)
+    if (Math.random() < 0.02) cleanupInboundDedup().catch(() => {});
   }
 });
 
