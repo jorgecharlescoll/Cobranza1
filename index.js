@@ -1,5 +1,5 @@
 // index.js — FlowSense (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
-// v-2025-12-31-BLOQUE6-DB-DEDUP-MULTIINSTANCE
+// v-2025-12-31-BLOQUE7-TWILIO-SIGNATURE
 
 require("dotenv").config();
 
@@ -22,7 +22,7 @@ const {
 } = require("./db");
 
 const app = express();
-const VERSION = "v-2025-12-31-BLOQUE6-DB-DEDUP-MULTIINSTANCE";
+const VERSION = "v-2025-12-31-BLOQUE7-TWILIO-SIGNATURE";
 
 // -------------------------
 // Shared Twilio outbound (para enviar recordatorios al cliente)
@@ -30,6 +30,9 @@ const VERSION = "v-2025-12-31-BLOQUE6-DB-DEDUP-MULTIINSTANCE";
 const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+
+const TWILIO_VALIDATE_SIGNATURE =
+  String(process.env.TWILIO_VALIDATE_SIGNATURE || "true").toLowerCase() !== "false";
 
 const twilioClient =
   TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
@@ -349,6 +352,7 @@ async function getTicketsOpen(limit = 10) {
 function normalizeText(s) {
   return String(s || "").trim().replace(/\s+/g, " ");
 }
+
 function normalizePhoneToWhatsApp(raw) {
   if (!raw) return null;
   let s = String(raw).trim();
@@ -482,7 +486,7 @@ async function safeResetPending(phone) {
 }
 
 // -------------------------
-// Bloque 3 — Anti-spam (rate limit) + Anti-replay/loops
+// Bloque 3 — Anti-spam (rate limit) + Anti-replay/loops (mem)
 // -------------------------
 class TTLMap {
   constructor() {
@@ -512,7 +516,7 @@ function sha1(input) {
   return crypto.createHash("sha1").update(String(input)).digest("hex");
 }
 
-// In-memory (fast) dedup — aún útil, pero DB será el “source of truth”
+// In-memory (fast) dedup — útil adicional, DB es el “source of truth”
 const DEDUP_SID_TTL_MS = 10 * 60 * 1000;
 const DEDUP_BODY_TTL_MS = 15 * 1000;
 
@@ -549,10 +553,6 @@ setInterval(() => {
 // -------------------------
 const DB_DEDUP_ENABLED = String(process.env.DB_DEDUP_ENABLED || "true").toLowerCase() !== "false";
 
-// TTL en DB: guardamos llaves cortas, y limpiamos con un delete simple
-const DB_DEDUP_TTL_SID_MS = 10 * 60 * 1000; // 10 min
-const DB_DEDUP_TTL_HASH_MS = 20 * 1000; // 20s (un poquito más que mem)
-
 async function ensureInboundDedupTable() {
   if (!DB_DEDUP_ENABLED) return;
   try {
@@ -571,16 +571,13 @@ async function ensureInboundDedupTable() {
   }
 }
 
-// Limpieza ligera (no crítica)
 async function cleanupInboundDedup() {
   if (!DB_DEDUP_ENABLED) return;
   try {
-    // borramos todo lo muy viejo (2 días) para que la tabla no crezca infinito
     await pool.query(`delete from public.inbound_dedup where created_at < now() - interval '2 days';`);
   } catch (_) {}
 }
 
-// Inserta llave única; si ya existe => duplicado
 async function dbDedupTryInsert({ key, phone, messageSid, payloadHash }) {
   if (!DB_DEDUP_ENABLED) return { ok: true, inserted: true, skipped: false };
   try {
@@ -596,22 +593,59 @@ async function dbDedupTryInsert({ key, phone, messageSid, payloadHash }) {
     const inserted = (r.rows || []).length > 0;
     return { ok: true, inserted, skipped: !inserted };
   } catch (err) {
-    // fail-open: no bloqueamos la operación si DB anda rara
     metric("DB_DEDUP_INSERT_FAIL", { message: err?.message || "unknown" });
+    // fail-open: si DB falla, seguimos para no romper el bot
     return { ok: false, inserted: true, skipped: false };
   }
 }
 
-async function dbDedupIsExpiredKey(key, ttlMs) {
-  if (!DB_DEDUP_ENABLED) return false;
-  // Opcional: no necesitamos check de expiración si usamos key único y TTL global de 2 días,
-  // pero para hash (ventana corta) sí nos conviene “barrer” hashes viejos.
-  // Implementación simple: borramos hashes viejos por tiempo sin consultar cada vez.
-  return false;
-}
-
 // Inicializa tabla al arrancar
 ensureInboundDedupTable().then(() => cleanupInboundDedup());
+
+// -------------------------
+// ✅ Bloque 7 — Validación de firma Twilio (seguridad)
+// -------------------------
+function getPublicUrlForTwilio(req) {
+  // Render/Proxy: usa X-Forwarded-Proto si existe
+  const proto =
+    (req.headers["x-forwarded-proto"] && String(req.headers["x-forwarded-proto"]).split(",")[0].trim()) ||
+    req.protocol ||
+    "https";
+  const host = req.headers["x-forwarded-host"] || req.headers["host"];
+  const base = `${proto}://${host}`;
+  // Twilio firma con URL completa sin query
+  return base + req.originalUrl.split("?")[0];
+}
+
+function validateTwilioSignature(req, res) {
+  if (!TWILIO_VALIDATE_SIGNATURE) {
+    metric("TWILIO_SIG_SKIPPED", { reason: "disabled_env" });
+    return true;
+  }
+  if (!TWILIO_AUTH_TOKEN) {
+    metric("TWILIO_SIG_SKIPPED", { reason: "missing_auth_token" });
+    return true; // fail-open si no hay token (para no tumbarte)
+  }
+
+  const sig = req.headers["x-twilio-signature"];
+  if (!sig) {
+    metric("TWILIO_SIG_FAIL", { reason: "missing_signature" });
+    return false;
+  }
+
+  const url = getPublicUrlForTwilio(req);
+  const params = req.body || {};
+
+  try {
+    const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, String(sig), url, params);
+    if (!ok) metric("TWILIO_SIG_FAIL", { reason: "invalid_signature", url });
+    else metric("TWILIO_SIG_OK", { url });
+    return ok;
+  } catch (e) {
+    metric("TWILIO_SIG_ERROR", { message: e?.message || "unknown" });
+    return false;
+  }
+}
 
 // -------------------------
 // Paywall + Pro logic
@@ -1041,8 +1075,13 @@ app.post("/webhook/stripe", async (req, res) => {
 // WhatsApp webhook
 // -------------------------
 app.post("/webhook/whatsapp", async (req, res) => {
-  const startedAt = Date.now();
   const reqId = makeReqId();
+
+  // ✅ Bloque 7: validar firma Twilio ANTES de procesar
+  if (!validateTwilioSignature(req, res)) {
+    // Importante: Twilio acepta 403, pero NO debemos devolver TwiML aquí
+    return res.status(403).send("Forbidden");
+  }
 
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twimlResp = new MessagingResponse();
@@ -1054,7 +1093,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
   // ✅ Bloque 6: DB dedup (multi-instancia) + Bloque 3: mem dedup + rate limit
   try {
-    // 1) DB dedup por SID si existe
     if (messageSid) {
       const keySid = `sid:${messageSid}`;
       const rSid = await dbDedupTryInsert({ key: keySid, phone: from, messageSid, payloadHash: null });
@@ -1064,7 +1102,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // 2) DB dedup por hash (ventana corta)
     const payloadHash = sha1(`${String(from || "")}|${String(body || "")}`);
     const keyHash = `hash:${payloadHash}`;
     const rHash = await dbDedupTryInsert({ key: keyHash, phone: from, messageSid: messageSid || null, payloadHash });
@@ -1073,7 +1110,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // 3) In-memory dedup (rápido, extra)
     if (messageSid) {
       if (dedupMessageSid.has(messageSid)) {
         metric("DEDUP_SKIPPED", { reqId, from, reason: "mem_message_sid", messageSid });
@@ -1088,7 +1124,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
     }
     dedupPayloadHash.set(payloadHash, DEDUP_BODY_TTL_MS);
 
-    // 4) Rate limit
     if (from && isRateLimited(from)) {
       metric("RATE_LIMIT", { reqId, from, window_ms: RL_WINDOW_MS, max: RL_MAX_MSGS });
       twimlResp.message(COPY.rateLimited);
@@ -1109,21 +1144,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
     metric("USER_ACTIVE", { reqId, day: dayKey(), user_id: user.id, phone });
     bumpDailyUserMetric(dayKey(), user.id, phone, "messages", 1).catch(() => {});
 
-    // Onboarding
     if (!user.seen_onboarding) {
       await updateUser(phone, { seen_onboarding: true });
       respond(twimlResp, COPY.onboarding);
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Cancel in any state
     if (isNo(body)) {
       await safeResetPending(phone);
       respond(twimlResp, "Cancelado ✅");
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pending: support collect
     if (user.pending_action === "support_collect") {
       const msg = normalizeText(body);
       if (!msg) {
@@ -1142,7 +1174,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pending: pro ask name -> activate trial
     if (user.pending_action === "pro_ask_name") {
       if (looksLikeNewCommand(body)) {
         await safeResetPending(phone);
@@ -1173,7 +1204,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // Pending: reminder tone selection
     if (user.pending_action === "remind_choose_tone") {
       if (looksLikeNewCommand(body)) {
         await safeResetPending(phone);
@@ -1217,7 +1247,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // Pending: reminder confirm
     if (user.pending_action === "remind_confirm") {
       if (looksLikeNewCommand(body)) {
         await safeResetPending(phone);
@@ -1272,7 +1301,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // Intent parse: hard-guard PAGAR -> local -> OpenAI
     let parsed = null;
     if (normalizeText(body).toLowerCase() === "pagar") {
       parsed = { intent: "pay" };
@@ -1323,7 +1351,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Support start
     if (parsed.intent === "support_start") {
       await updateUser(phone, {
         pending_action: "support_collect",
@@ -1333,7 +1360,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Support inline
     if (parsed.intent === "support_inline") {
       const msg = normalizeText(parsed.message || "");
       if (!msg) {
@@ -1347,13 +1373,11 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pricing
     if (parsed.intent === "pricing") {
       respond(twimlResp, COPY.pricing);
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Want Pro (start trial flow)
     if (parsed.intent === "want_pro") {
       if (isPro(user)) {
         respond(twimlResp, COPY.alreadyPro);
@@ -1366,7 +1390,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pay
     if (parsed.intent === "pay") {
       if (!stripeReady()) {
         respond(twimlResp, "⚠️ Pagos no configurados todavía. Revisa variables STRIPE_* en Render (Web Service).");
@@ -1381,14 +1404,12 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Paywall for billable intents
     const gate = await enforcePaywallIfNeeded({ user, reqId, intent: parsed.intent, twiml: twimlResp });
     user = gate.user;
     const appendLowActions = Boolean(gate.lowActionsWarning);
 
     if (gate.blocked) return res.type("text/xml").send(twimlResp.toString());
 
-    // SAVE PHONE
     if (parsed.intent === "save_phone") {
       const clientName = parsed.client_name;
       const normalized = normalizePhoneToWhatsApp(parsed.phone);
@@ -1409,7 +1430,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // LIST DEBTS
     if (parsed.intent === "list_debts") {
       const debts = await listPendingDebts(user.id);
 
@@ -1428,7 +1448,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // ADD DEBT
     if (parsed.intent === "add_debt") {
       const clientName = parsed.client_name || "Cliente";
       const amount = parsed.amount_due;
@@ -1453,7 +1472,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // PRIORITIZE
     if (parsed.intent === "prioritize") {
       const debts = await listPendingDebts(user.id);
 
@@ -1485,7 +1503,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // MARK PAID
     if (parsed.intent === "mark_paid") {
       const clientName = parsed.client_name;
       if (!clientName) {
@@ -1503,7 +1520,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // REMIND (start flow)
     if (parsed.intent === "remind") {
       const clientName = parsed.client_name || null;
       if (!clientName) {
@@ -1528,13 +1544,11 @@ app.post("/webhook/whatsapp", async (req, res) => {
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // HELP
     if (parsed.intent === "help") {
       respond(twimlResp, COPY.help);
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // fallback
     respond(
       twimlResp,
       `Te leo. Prueba:\n` +
@@ -1556,7 +1570,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
     twimlResp.message("⚠️ Hubo un problema temporal. Intenta de nuevo en un momento.");
     return res.type("text/xml").send(twimlResp.toString());
   } finally {
-    // limpieza ocasional (no bloqueante)
     if (Math.random() < 0.02) cleanupInboundDedup().catch(() => {});
   }
 });
