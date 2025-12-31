@@ -1,5 +1,5 @@
 // index.js — FlowSense (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
-// v-2025-12-31-BLOQUE3-RATE-LIMIT-DEDUP
+// v-2025-12-31-BLOQUE4-REMINDERS-END2END
 
 require("dotenv").config();
 
@@ -22,7 +22,31 @@ const {
 } = require("./db");
 
 const app = express();
-const VERSION = "v-2025-12-31-BLOQUE3-RATE-LIMIT-DEDUP";
+const VERSION = "v-2025-12-31-BLOQUE4-REMINDERS-END2END";
+
+// -------------------------
+// Shared Twilio outbound (para enviar recordatorios al cliente)
+// -------------------------
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+
+const twilioClient =
+  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
+    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    : null;
+
+async function sendWhatsAppOut(to, text) {
+  if (!twilioClient) return false;
+  if (!to || !text) return false;
+
+  await twilioClient.messages.create({
+    from: TWILIO_WHATSAPP_FROM,
+    to,
+    body: text,
+  });
+  return true;
+}
 
 // -------------------------
 // Admin controls
@@ -431,7 +455,7 @@ function estimateDays(dueText) {
   return 30;
 }
 
-// Reminder copy (kept)
+// Reminder copy
 function buildReminderMessage(tone, clientName, debtLine) {
   const name = clientName || "hola";
   const extra = debtLine ? `\n\n${debtLine}` : "";
@@ -440,6 +464,27 @@ function buildReminderMessage(tone, clientName, debtLine) {
   if (tone === "urgente")
     return `Hola ${name}.\nEste es un recordatorio URGENTE del pago pendiente. Necesito confirmación inmediata de cuándo lo vas a cubrir.${extra}`;
   return `Hola ${name} 👋\nTe escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?${extra}`;
+}
+
+async function getLatestDebtLineForClient(userId, clientName) {
+  try {
+    const debts = await listPendingDebts(userId);
+    const filtered = (debts || []).filter(
+      (d) =>
+        String(d.client_name || "").toLowerCase() ===
+        String(clientName || "").toLowerCase()
+    );
+    if (!filtered.length) return null;
+    const d = filtered[0];
+    const amt = Number(d.amount_due || 0).toLocaleString("es-MX", {
+      style: "currency",
+      currency: "MXN",
+    });
+    const since = d.due_text ? ` (desde ${d.due_text})` : "";
+    return `Deuda: ${amt}${since}`;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function safeResetPending(phone) {
@@ -480,17 +525,16 @@ function sha1(input) {
 }
 
 // Dedup TTLs
-const DEDUP_SID_TTL_MS = 10 * 60 * 1000; // 10 min para MessageSid (seguro)
-const DEDUP_BODY_TTL_MS = 15 * 1000;     // 15s para mismo from+body (anti-retry/loop)
+const DEDUP_SID_TTL_MS = 10 * 60 * 1000; // 10 min
+const DEDUP_BODY_TTL_MS = 15 * 1000; // 15s
 
-// Dedup stores (memoria del proceso)
 const dedupMessageSid = new TTLMap();
 const dedupPayloadHash = new TTLMap();
 
 // Rate limit config
 const RL_WINDOW_MS = 15 * 1000; // 15s
-const RL_MAX_MSGS = 6;          // 6 msgs en 15s
-const rlState = new Map();      // phone -> [timestamps]
+const RL_MAX_MSGS = 6; // 6 msgs / 15s
+const rlState = new Map();
 
 function isRateLimited(phone) {
   const now = Date.now();
@@ -504,7 +548,6 @@ function isRateLimited(phone) {
 setInterval(() => {
   dedupMessageSid.cleanup();
   dedupPayloadHash.cleanup();
-  // rate limit cleanup simple
   const now = Date.now();
   for (const [k, arr] of rlState.entries()) {
     const fresh = arr.filter((t) => now - t < RL_WINDOW_MS);
@@ -781,11 +824,11 @@ app.post("/webhook/stripe", async (req, res) => {
   };
 
   const sendWhatsApp = async (to, text) => {
-    if (!to || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return false;
-    const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-    await twilioClient.messages.create({ from: fromWa, to, body: text });
-    return true;
+    try {
+      return await sendWhatsAppOut(to, text);
+    } catch (_) {
+      return false;
+    }
   };
 
   try {
@@ -960,33 +1003,29 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const body = String(bodyRaw).trim();
   const messageSid = req.body.MessageSid || null;
 
-  // --- Bloque 3: anti-replay + anti-loop (antes de todo)
+  // --- Bloque 3: anti-replay + anti-loop + rate limit (antes de todo)
   try {
-    // Dedup por MessageSid (Twilio)
     if (messageSid) {
       if (dedupMessageSid.has(messageSid)) {
         metric("DEDUP_SKIPPED", { reqId, from, reason: "message_sid", messageSid });
-        return res.type("text/xml").send(twimlResp.toString()); // <Response/>
+        return res.type("text/xml").send(twimlResp.toString());
       }
       dedupMessageSid.set(messageSid, DEDUP_SID_TTL_MS);
     }
 
-    // Dedup por hash from+body (ventana corta)
     const payloadKey = sha1(`${String(from || "")}|${String(body || "")}`);
     if (dedupPayloadHash.has(payloadKey)) {
       metric("DEDUP_SKIPPED", { reqId, from, reason: "payload_hash", payloadKey });
-      return res.type("text/xml").send(twimlResp.toString()); // <Response/>
+      return res.type("text/xml").send(twimlResp.toString());
     }
     dedupPayloadHash.set(payloadKey, DEDUP_BODY_TTL_MS);
 
-    // Rate limit anti-spam
     if (from && isRateLimited(from)) {
       metric("RATE_LIMIT", { reqId, from, window_ms: RL_WINDOW_MS, max: RL_MAX_MSGS });
       twimlResp.message(COPY.rateLimited);
       return res.type("text/xml").send(twimlResp.toString());
     }
   } catch (e) {
-    // Si algo falla en dedup/rate-limit, NO rompemos el flujo.
     metric("BLOQUE3_FAIL_OPEN", { reqId, message: e?.message || "unknown" });
   }
 
@@ -1036,6 +1075,111 @@ app.post("/webhook/whatsapp", async (req, res) => {
       respond(twimlResp, COPY.supportThanks);
       metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
+    }
+
+    // ✅ Bloque 4 — Pending: reminder tone selection
+    if (user.pending_action === "remind_choose_tone") {
+      if (looksLikeNewCommand(body)) {
+        await safeResetPending(phone);
+      } else {
+        const toneRaw = normalizeText(body).toLowerCase();
+        const tone = ["amable", "firme", "urgente"].includes(toneRaw) ? toneRaw : null;
+
+        const payload = user.pending_payload || {};
+        const clientName = payload.clientName || payload.client_name || null;
+        const toPhone = payload.toPhone || payload.to_phone || null;
+
+        if (!tone) {
+          respond(
+            twimlResp,
+            `Elige un tono para el recordatorio a *${clientName || "tu cliente"}*:\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`
+          );
+          metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+          return res.type("text/xml").send(twimlResp.toString());
+        }
+
+        const debtLine = clientName ? await getLatestDebtLineForClient(user.id, clientName) : null;
+        const preview = buildReminderMessage(tone, clientName, debtLine);
+
+        await updateUser(phone, {
+          pending_action: "remind_confirm",
+          pending_payload: { clientName, toPhone, tone, preview, debtLine },
+        });
+
+        metric("REMINDER_TONE_CHOSEN", {
+          reqId,
+          user_id: user.id,
+          client: clientName,
+          tone,
+          has_client_phone: Boolean(toPhone),
+        });
+
+        respond(
+          twimlResp,
+          `📝 *Preview (${tone})* para *${clientName || "tu cliente"}*:\n\n"${preview}"\n\n¿Lo envío?\nResponde: SI / NO`
+        );
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twimlResp.toString());
+      }
+    }
+
+    // ✅ Bloque 4 — Pending: reminder confirm send/cancel
+    if (user.pending_action === "remind_confirm") {
+      if (looksLikeNewCommand(body)) {
+        await safeResetPending(phone);
+      } else {
+        const payload = user.pending_payload || {};
+        const clientName = payload.clientName || payload.client_name || null;
+        const toPhone = payload.toPhone || payload.to_phone || null;
+        const tone = payload.tone || "amable";
+        const preview = payload.preview || buildReminderMessage(tone, clientName, payload.debtLine || null);
+
+        if (!isYes(body)) {
+          respond(twimlResp, `Responde *SI* para enviar o *NO* para cancelar.\n\nPreview:\n"${preview}"`);
+          metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+          return res.type("text/xml").send(twimlResp.toString());
+        }
+
+        // YES -> send
+        if (!toPhone) {
+          await safeResetPending(phone);
+          metric("REMINDER_NO_PHONE", { reqId, user_id: user.id, client: clientName });
+
+          respond(
+            twimlResp,
+            `⚠️ No tengo el teléfono de *${clientName || "ese cliente"}*.\n\n` +
+              `Guárdalo así:\n"Guarda teléfono de ${clientName || "Nombre"} +521833..."\n\n` +
+              `Si quieres, copia y pega este mensaje manualmente:\n\n"${preview}"`
+          );
+          metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+          return res.type("text/xml").send(twimlResp.toString());
+        }
+
+        let sent = false;
+        try {
+          sent = await sendWhatsAppOut(toPhone, preview);
+        } catch (_) {
+          sent = false;
+        }
+
+        await safeResetPending(phone);
+
+        if (sent) {
+          metric("REMINDER_SENT", { reqId, user_id: user.id, client: clientName, toPhone, tone });
+          respond(twimlResp, `✅ Listo. Envié el recordatorio a *${clientName || "tu cliente"}*.`);
+        } else {
+          metric("REMINDER_SEND_FAILED", { reqId, user_id: user.id, client: clientName, toPhone, tone });
+          respond(
+            twimlResp,
+            `⚠️ No pude enviar el recordatorio automáticamente.\n\n` +
+              `Verifica Twilio/WhatsApp Sandbox y vuelve a intentar.\n\n` +
+              `Mensaje (para copiar y pegar):\n"${preview}"`
+          );
+        }
+
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+        return res.type("text/xml").send(twimlResp.toString());
+      }
     }
 
     // -------------------------
