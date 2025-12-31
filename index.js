@@ -1,4 +1,4 @@
-// index.js — FlowSense (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
+// index.js — CobranzaBot (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
 // v-2025-12-30-COPYS-UX-SUPPORT
 
 require("dotenv").config();
@@ -128,7 +128,7 @@ function metric(event, data = {}) {
 // -------------------------
 const COPY = {
   onboarding:
-    `👋 Hola, soy *FlowSense*.\n\n` +
+    `👋 Hola, soy *CobranzaBot*.\n\n` +
     `Te ayudo a cobrar mejor por WhatsApp:\n` +
     `• Registrar deudas\n` +
     `• Saber quién te debe\n` +
@@ -163,7 +163,7 @@ const COPY = {
     `Escribe tal cual, yo me encargo del resto 😉`,
 
   pricing:
-    `💳 *Planes FlowSense*\n\n` +
+    `💳 *Planes CobranzaBot*\n\n` +
     `🆓 *Gratis*\n` +
     `• Hasta 15 acciones al día\n` +
     `• Ideal para uso ocasional\n\n` +
@@ -176,13 +176,13 @@ const COPY = {
 
   wantProAskName:
     `🚀 ¡Excelente decisión!\n\n` +
-    `Te activaré *FlowSense Pro* con una prueba gratis.\n` +
+    `Te activaré *CobranzaBot Pro* con una prueba gratis.\n` +
     `Antes dime:\n\n` +
     `👉 ¿Cómo te llamas o cómo se llama tu negocio?\n` +
     `(Ejemplo: "Tienda Pepe")`,
 
   proTrialActivated: (days, proUntilISO) =>
-    `✅ *FlowSense Pro activado*\n\n` +
+    `✅ *CobranzaBot Pro activado*\n\n` +
     `Tienes acceso completo durante tu prueba:\n` +
     `• Acciones ilimitadas\n` +
     `• Recordatorios sin límite\n` +
@@ -193,26 +193,26 @@ const COPY = {
   lowActionsWarning:
     `ℹ️ Aviso rápido\n\n` +
     `Te quedan *3 acciones gratis* hoy.\n` +
-    `Si usas FlowSense a diario, Pro te evita límites.\n\n` +
+    `Si usas CobranzaBot a diario, Pro te evita límites.\n\n` +
     `👉 Escribe *PRECIO* o *QUIERO PRO*`,
 
   paywallHit:
     `⚠️ Límite alcanzado por hoy\n\n` +
     `Usaste tus acciones gratis.\n` +
-    `Con *FlowSense Pro* puedes seguir sin límites.\n\n` +
+    `Con *CobranzaBot Pro* puedes seguir sin límites.\n\n` +
     `👉 Escribe *PAGAR* para activar Pro\n` +
     `👉 O *PRECIO* para ver planes`,
 
   payLink: (link) =>
-    `💳 *Activar FlowSense Pro*\n\n` +
+    `💳 *Activar CobranzaBot Pro*\n\n` +
     `Aquí tienes tu link de pago seguro:\n👇\n` +
     `${link}\n\n` +
     `En cuanto se confirme el pago, yo te activo Pro automáticamente ✅`,
 
   payConfirmed:
     `✅ *Pago confirmado*\n\n` +
-    `Tu suscripción *FlowSense Pro* ya está activa.\n` +
-    `Ahora puedes usar FlowSense sin límites.\n\n` +
+    `Tu suscripción *CobranzaBot Pro* ya está activa.\n` +
+    `Ahora puedes usar CobranzaBot sin límites.\n\n` +
     `¡Gracias por confiar! 🚀`,
 
   payFailed:
@@ -223,12 +223,12 @@ const COPY = {
 
   proEnded:
     `ℹ️ Tu suscripción Pro terminó\n\n` +
-    `Ahora sigues usando *FlowSense Gratis* con límite diario.\n` +
+    `Ahora sigues usando *CobranzaBot Gratis* con límite diario.\n` +
     `Cuando quieras volver a Pro:\n\n` +
     `👉 Escribe *PAGAR*`,
 
   supportAsk:
-    `🛠️ *Soporte FlowSense*\n\n` +
+    `🛠️ *Soporte CobranzaBot*\n\n` +
     `Cuéntame qué pasó (en una sola frase si puedes).\n` +
     `Ejemplo: "No detecta 'Guarda teléfono'"\n\n` +
     `Escribe tu reporte ahora, o "cancelar".`,
@@ -241,7 +241,7 @@ const COPY = {
     `🗑️ *Borrar mi cuenta*
 
 ` +
-    `Esto eliminará tus clientes y deudas guardadas en FlowSense.
+    `Esto eliminará tus clientes y deudas guardadas en CobranzaBot.
 ` +
     `⚠️ Si tienes una suscripción Pro por Stripe, *debes cancelarla también* desde el link de Stripe/tu banco.
 
@@ -254,7 +254,7 @@ const COPY = {
     `✅ Cuenta borrada.
 
 ` +
-    `Eliminé tus datos de FlowSense.
+    `Eliminé tus datos de CobranzaBot.
 ` +
     `Si algún día quieres volver, solo escribe: *HOLA*`,
 
