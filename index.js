@@ -1,12 +1,11 @@
 // index.js — FlowSense (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
-// v-2025-12-31-BLOQUE9-PRODUCTION-CHECKLIST
+// v-2025-12-30-COPYS-UX-SUPPORT
 
 require("dotenv").config();
 
 const express = require("express");
 const twilio = require("twilio");
 const Stripe = require("stripe");
-const crypto = require("crypto");
 
 const { parseMessage } = require("./ai");
 const {
@@ -22,41 +21,7 @@ const {
 } = require("./db");
 
 const app = express();
-const VERSION = "v-2025-12-31-BLOQUE9-PRODUCTION-CHECKLIST";
-
-// -------------------------
-// ✅ Production switches (Bloque 9)
-// -------------------------
-const PROD_MODE = String(process.env.PROD_MODE || "false").toLowerCase() === "true";
-const KILL_SWITCH = String(process.env.KILL_SWITCH || "false").toLowerCase() === "true";
-const BILLING_DISABLED = String(process.env.BILLING_DISABLED || "false").toLowerCase() === "true";
-
-// -------------------------
-// Shared Twilio outbound
-// -------------------------
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const TWILIO_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-
-const TWILIO_VALIDATE_SIGNATURE =
-  String(process.env.TWILIO_VALIDATE_SIGNATURE || "true").toLowerCase() !== "false";
-
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    : null;
-
-async function sendWhatsAppOut(to, text) {
-  if (!twilioClient) return false;
-  if (!to || !text) return false;
-
-  await twilioClient.messages.create({
-    from: TWILIO_WHATSAPP_FROM,
-    to,
-    body: text,
-  });
-  return true;
-}
+const VERSION = "v-2025-12-30-COPYS-UX-SUPPORT";
 
 // -------------------------
 // Admin controls
@@ -152,40 +117,14 @@ function makeReqId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 function logEvent(event, data = {}) {
-  if (PROD_MODE) return; // ✅ menos ruido en producción
   console.log(`[${event}]`, JSON.stringify({ ts: isoNow(), ...data }));
 }
 function metric(event, data = {}) {
-  // métricas sí (útiles incluso en producción)
   console.log(`[METRIC:${event}]`, JSON.stringify({ ts: isoNow(), ...data }));
 }
 
 // -------------------------
-// Legal (mínimo)
-// -------------------------
-const LEGAL = {
-  terms:
-    `📄 *TÉRMINOS FlowSense (resumen)*\n\n` +
-    `1) FlowSense es un asistente de organización de cobranza por WhatsApp.\n` +
-    `2) No garantizamos recuperación de pagos; solo apoyamos con registro, priorización y recordatorios.\n` +
-    `3) Eres responsable del uso que hagas de los mensajes enviados a tus clientes.\n` +
-    `4) Podemos actualizar el servicio y sus límites (Gratis/Pro).\n` +
-    `5) Si solicitas BAJA/STOP, dejamos de responderte.\n\n` +
-    `Para soporte: REPORTAR`,
-
-  privacy:
-    `🔒 *PRIVACIDAD FlowSense (resumen)*\n\n` +
-    `Guardamos lo mínimo para operar:\n` +
-    `• Tu teléfono (identificador)\n` +
-    `• Clientes/deudas que registras\n` +
-    `• Métricas básicas (uso diario)\n\n` +
-    `No vendemos tu información.\n` +
-    `Puedes pedir BAJA/STOP para dejar de recibir respuestas.\n\n` +
-    `Soporte: REPORTAR`,
-};
-
-// -------------------------
-// Copy blocks
+// Copy blocks (UX commercial)
 // -------------------------
 const COPY = {
   onboarding:
@@ -204,11 +143,8 @@ const COPY = {
     `Comandos útiles:\n` +
     `• AYUDA\n` +
     `• PRECIO\n` +
-    `• QUIERO PRO\n` +
     `• PAGAR\n` +
-    `• REPORTAR\n` +
-    `• PRIVACIDAD\n` +
-    `• TERMINOS`,
+    `• REPORTAR`,
 
   help:
     `🤖 *Así puedo ayudarte:*\n\n` +
@@ -217,26 +153,24 @@ const COPY = {
     `• "¿Quién me debe?"\n` +
     `• "¿A quién cobro primero?"\n` +
     `• "Manda recordatorio a Pepe"\n` +
-    `• "Guarda teléfono de Pepe +52..."\n` +
-    `• "Ya pagó Pepe"\n\n` +
+    `• "Guarda teléfono de Pepe +52..."\n\n` +
     `Planes:\n` +
     `• PRECIO → ver planes\n` +
     `• QUIERO PRO → prueba gratis\n` +
     `• PAGAR → activar Pro\n\n` +
-    `Legal:\n` +
-    `• PRIVACIDAD\n` +
-    `• TERMINOS\n\n` +
     `Soporte:\n` +
-    `• REPORTAR → enviar un problema\n` +
-    `• BAJA / STOP → dejar de recibir respuestas`,
+    `• REPORTAR → enviar un problema\n\n` +
+    `Escribe tal cual, yo me encargo del resto 😉`,
 
   pricing:
     `💳 *Planes FlowSense*\n\n` +
     `🆓 *Gratis*\n` +
-    `• Hasta 15 acciones al día\n\n` +
+    `• Hasta 15 acciones al día\n` +
+    `• Ideal para uso ocasional\n\n` +
     `🚀 *Pro*\n` +
     `• Acciones ilimitadas\n` +
-    `• Resumen diario automático\n\n` +
+    `• Resumen diario automático\n` +
+    `• Ideal si cobras todos los días\n\n` +
     `👉 Escribe *QUIERO PRO* para probar gratis\n` +
     `👉 Escribe *PAGAR* para activar Pro`,
 
@@ -247,20 +181,14 @@ const COPY = {
     `👉 ¿Cómo te llamas o cómo se llama tu negocio?\n` +
     `(Ejemplo: "Tienda Pepe")`,
 
-  proTrialActivated: (days, proUntilISO, businessName) =>
+  proTrialActivated: (days, proUntilISO) =>
     `✅ *FlowSense Pro activado*\n\n` +
-    (businessName ? `🙌 Listo, *${businessName}*.\n\n` : "") +
     `Tienes acceso completo durante tu prueba:\n` +
     `• Acciones ilimitadas\n` +
     `• Recordatorios sin límite\n` +
     `• Resumen diario\n\n` +
     `Tu prueba vence: ${String(proUntilISO || "").slice(0, 10)}\n\n` +
     `Cuando quieras continuar:\n👉 Escribe *PAGAR*`,
-
-  alreadyPro:
-    `✅ Ya tienes *FlowSense Pro* activo.\n\n` +
-    `Puedes seguir usando FlowSense sin límites.\n` +
-    `Si necesitas ayuda: escribe *AYUDA*.`,
 
   lowActionsWarning:
     `ℹ️ Aviso rápido\n\n` +
@@ -289,7 +217,8 @@ const COPY = {
 
   payFailed:
     `⚠️ Pago no realizado\n\n` +
-    `No se pudo procesar tu pago.\n\n` +
+    `No se pudo procesar tu pago.\n` +
+    `Para evitar interrupciones en Pro, actualiza tu método de pago.\n\n` +
     `👉 Escribe *PAGAR* para intentarlo de nuevo`,
 
   proEnded:
@@ -308,24 +237,31 @@ const COPY = {
     `✅ Gracias. Ya registré tu reporte.\n` +
     `Lo revisaré y te aviso aquí mismo. 🙌`,
 
-  rateLimited:
-    `🕒 Voy un poco saturado con tantos mensajes seguidos.\n` +
-    `Dame *unos segundos* y vuelve a intentar.\n\n` +
-    `Tip: manda *un solo mensaje* con toda la info (cliente + monto + fecha).`,
+  deleteStart:
+    `🗑️ *Borrar mi cuenta*
 
-  optOutOk:
-    `✅ Listo.\n\n` +
-    `Te di de baja y ya no te responderé.\n` +
-    `Si algún día quieres volver, escribe: *ALTA*`,
+` +
+    `Esto eliminará tus clientes y deudas guardadas en FlowSense.
+` +
+    `⚠️ Si tienes una suscripción Pro por Stripe, *debes cancelarla también* desde el link de Stripe/tu banco.
 
-  maintenance:
-    `⚙️ FlowSense está en mantenimiento.\n\n` +
-    `Intenta de nuevo en unos minutos.\n` +
-    `Si es urgente, escribe *REPORTAR* cuando regrese el servicio.`,
+` +
+    `Para confirmar escribe: *BORRAR*
+` +
+    `Para cancelar escribe: *cancelar*`,
+
+  deleteDone:
+    `✅ Cuenta borrada.
+
+` +
+    `Eliminé tus datos de FlowSense.
+` +
+    `Si algún día quieres volver, solo escribe: *HOLA*`,
+
 };
 
 // -------------------------
-// Observability minimal (optional tables)
+// Minimal DB observability (optional tables)
 // -------------------------
 async function bumpDailyUserMetric(day, userId, phone, field, inc = 1) {
   try {
@@ -347,6 +283,25 @@ async function bumpDailyUserMetric(day, userId, phone, field, inc = 1) {
     );
   } catch (err) {
     metric("OBS_DB_FAIL", { stage: "bumpDailyUserMetric", message: err?.message || "unknown" });
+  }
+}
+
+async function bumpDailyEvent(day, eventName, meta = null, inc = 1) {
+  try {
+    await pool.query(
+      `
+      insert into public.daily_event_counters (day, event, count, last_ts, last_meta)
+      values ($1, $2, $3, now(), $4)
+      on conflict (day, event)
+      do update set
+        count = public.daily_event_counters.count + $3,
+        last_ts = now(),
+        last_meta = coalesce($4, public.daily_event_counters.last_meta)
+      `,
+      [day, eventName, inc, meta]
+    );
+  } catch (err) {
+    metric("OBS_DB_FAIL", { stage: "bumpDailyEvent", message: err?.message || "unknown" });
   }
 }
 
@@ -392,115 +347,27 @@ async function getTicketsOpen(limit = 10) {
   return r.rows || [];
 }
 
-// -------------------------
-// Opt-out persistente
-// -------------------------
-async function ensureOptOutsTable() {
-  try {
-    await pool.query(`
-      create table if not exists public.opt_outs (
-        phone text primary key,
-        created_at timestamptz not null default now(),
-        reason text
-      );
-    `);
-    await pool.query(`create index if not exists idx_opt_outs_created_at on public.opt_outs (created_at desc);`);
-  } catch (err) {
-    metric("OPTOUT_INIT_FAIL", { message: err?.message || "unknown" });
-  }
-}
 
-async function isOptedOut(phone) {
+async function deleteUserAccount(userId, phone) {
+  // ⚠️ This deletes user-owned records. Stripe subscriptions must be canceled separately by the user.
+  const client = await pool.connect();
   try {
-    const r = await pool.query(`select phone from public.opt_outs where phone = $1 limit 1`, [phone]);
-    return (r.rows || []).length > 0;
-  } catch (err) {
-    metric("OPTOUT_CHECK_FAIL", { message: err?.message || "unknown" });
-    return false;
-  }
-}
+    await client.query("begin");
+    await client.query("delete from public.debts where user_id = $1", [userId]);
+    await client.query("delete from public.clients where user_id = $1", [userId]);
+    await client.query("delete from public.support_tickets where user_id = $1", [userId]);
+    await client.query("delete from public.daily_user_metrics where user_id = $1", [userId]);
+    // Keep stripe_events (global dedup) as-is.
 
-async function optOut(phone, reason) {
-  try {
-    await pool.query(
-      `
-      insert into public.opt_outs (phone, reason)
-      values ($1, $2)
-      on conflict (phone) do update set reason = excluded.reason
-      `,
-      [phone, reason || null]
-    );
-    return true;
-  } catch (err) {
-    metric("OPTOUT_WRITE_FAIL", { message: err?.message || "unknown" });
-    return false;
-  }
-}
+    // Finally remove user row
+    await client.query("delete from public.users where id = $1", [userId]);
 
-async function optIn(phone) {
-  try {
-    await pool.query(`delete from public.opt_outs where phone = $1`, [phone]);
-    return true;
+    await client.query("commit");
   } catch (err) {
-    metric("OPTOUT_DELETE_FAIL", { message: err?.message || "unknown" });
-    return false;
-  }
-}
-
-ensureOptOutsTable().catch(() => {});
-
-// -------------------------
-// Admin KPIs
-// -------------------------
-async function getKpisToday() {
-  const d = dayKey();
-  const out = { day: d, users: 0, messages: 0, billable: 0, unknown: 0 };
-  try {
-    const r1 = await pool.query(
-      `select count(*)::int as users,
-              coalesce(sum(messages),0)::int as messages,
-              coalesce(sum(billable),0)::int as billable,
-              coalesce(sum(unknown),0)::int as unknown
-       from public.daily_user_metrics
-       where day = $1`,
-      [d]
-    );
-    const row = r1.rows?.[0];
-    if (row) {
-      out.users = row.users || 0;
-      out.messages = row.messages || 0;
-      out.billable = row.billable || 0;
-      out.unknown = row.unknown || 0;
-    }
-  } catch (err) {
-    metric("KPI_FAIL", { stage: "daily_user_metrics", message: err?.message || "unknown" });
-  }
-  return out;
-}
-
-async function getProActiveCount() {
-  try {
-    const r = await pool.query(
-      `
-      select count(*)::int as cnt
-      from public.users
-      where
-        (
-          (coalesce(plan,'') = 'pro')
-          and (
-            pro_until is null
-            or pro_until > now()
-            or coalesce(pro_source,'') = 'stripe'
-            or (stripe_current_period_end is not null and stripe_current_period_end > now())
-          )
-        )
-        or (pro_until is not null and pro_until > now())
-      `
-    );
-    return r.rows?.[0]?.cnt || 0;
-  } catch (err) {
-    metric("KPI_FAIL", { stage: "pro_active_count", message: err?.message || "unknown" });
-    return 0;
+    await client.query("rollback");
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
@@ -542,27 +409,19 @@ function isNo(text) {
   return ["no", "cancelar", "cancela", "alto", "detener"].includes(t);
 }
 
-function isOptOutCommand(text) {
+function isDeleteConfirm(text) {
   const t = normalizeText(text).toLowerCase();
-  return t === "stop" || t === "baja" || t === "cancelar suscripcion" || t === "cancelar suscripción";
+  return t === "borrar" || t === "confirmar" || t === "si borrar" || t === "sí borrar";
 }
-function isOptInCommand(text) {
-  const t = normalizeText(text).toLowerCase();
-  return t === "alta" || t === "reactivar";
-}
+
 
 function looksLikeNewCommand(text) {
   const t = normalizeText(text).toLowerCase();
   if (t.length < 2) return false;
   if (t === "ayuda" || t === "help") return true;
   if (t === "precio" || t === "precios") return true;
-  if (t === "quiero pro" || t === "pro") return true;
   if (t === "pagar" || t === "pago") return true;
   if (t === "reportar" || t.startsWith("reportar ")) return true;
-  if (t === "privacidad" || t === "terminos" || t === "términos") return true;
-  if (t === "kpis hoy" || t === "usuarios hoy" || t === "pro activos") return true;
-  if (t === "tickets hoy" || t === "tickets abiertos") return true;
-  if (isOptOutCommand(t) || isOptInCommand(t)) return true;
   if (t.includes("me debe") || t.includes("me deben") || t.includes("quedó a deber")) return true;
   if (t.includes("quien me debe") || t.includes("quién me debe")) return true;
   if (t.includes("a quien cobro primero") || t.includes("a quién cobro primero")) return true;
@@ -578,6 +437,7 @@ function addDaysISO(days) {
   return d.toISOString();
 }
 
+// Simple estimator for prioritize
 function estimateDays(dueText) {
   if (!dueText) return 0;
   const t = String(dueText).toLowerCase();
@@ -617,6 +477,7 @@ function estimateDays(dueText) {
   return 30;
 }
 
+// Reminder copy (kept)
 function buildReminderMessage(tone, clientName, debtLine) {
   const name = clientName || "hola";
   const extra = debtLine ? `\n\n${debtLine}` : "";
@@ -627,186 +488,10 @@ function buildReminderMessage(tone, clientName, debtLine) {
   return `Hola ${name} 👋\nTe escribo para recordarte un pago pendiente. ¿Me confirmas cuándo podrás cubrirlo?${extra}`;
 }
 
-async function getLatestDebtLineForClient(userId, clientName) {
-  try {
-    const debts = await listPendingDebts(userId);
-    const filtered = (debts || []).filter(
-      (d) =>
-        String(d.client_name || "").toLowerCase() ===
-        String(clientName || "").toLowerCase()
-    );
-    if (!filtered.length) return null;
-    const d = filtered[0];
-    const amt = Number(d.amount_due || 0).toLocaleString("es-MX", {
-      style: "currency",
-      currency: "MXN",
-    });
-    const since = d.due_text ? ` (desde ${d.due_text})` : "";
-    return `Deuda: ${amt}${since}`;
-  } catch (_) {
-    return null;
-  }
-}
-
 async function safeResetPending(phone) {
   try {
     await updateUser(phone, { pending_action: null, pending_payload: null });
   } catch (_) {}
-}
-
-// -------------------------
-// Anti-spam + Anti-replay
-// -------------------------
-class TTLMap {
-  constructor() {
-    this.map = new Map();
-  }
-  set(key, ttlMs) {
-    this.map.set(key, Date.now() + ttlMs);
-  }
-  has(key) {
-    const exp = this.map.get(key);
-    if (!exp) return false;
-    if (Date.now() > exp) {
-      this.map.delete(key);
-      return false;
-    }
-    return true;
-  }
-  cleanup() {
-    const now = Date.now();
-    for (const [k, exp] of this.map.entries()) {
-      if (now > exp) this.map.delete(k);
-    }
-  }
-}
-
-function sha1(input) {
-  return crypto.createHash("sha1").update(String(input)).digest("hex");
-}
-
-const DEDUP_SID_TTL_MS = 10 * 60 * 1000;
-const DEDUP_BODY_TTL_MS = 15 * 1000;
-const dedupMessageSid = new TTLMap();
-const dedupPayloadHash = new TTLMap();
-
-const RL_WINDOW_MS = 15 * 1000;
-const RL_MAX_MSGS = 6;
-const rlState = new Map();
-
-function isRateLimited(phone) {
-  const now = Date.now();
-  const arr = rlState.get(phone) || [];
-  const fresh = arr.filter((t) => now - t < RL_WINDOW_MS);
-  fresh.push(now);
-  rlState.set(phone, fresh);
-  return fresh.length > RL_MAX_MSGS;
-}
-
-setInterval(() => {
-  dedupMessageSid.cleanup();
-  dedupPayloadHash.cleanup();
-  const now = Date.now();
-  for (const [k, arr] of rlState.entries()) {
-    const fresh = arr.filter((t) => now - t < RL_WINDOW_MS);
-    if (!fresh.length) rlState.delete(k);
-    else rlState.set(k, fresh);
-  }
-}, 30 * 1000).unref();
-
-// -------------------------
-// DB Dedup (multi-instancia)
-// -------------------------
-const DB_DEDUP_ENABLED = String(process.env.DB_DEDUP_ENABLED || "true").toLowerCase() !== "false";
-
-async function ensureInboundDedupTable() {
-  if (!DB_DEDUP_ENABLED) return;
-  try {
-    await pool.query(`
-      create table if not exists public.inbound_dedup (
-        k text primary key,
-        created_at timestamptz not null default now(),
-        phone text,
-        message_sid text,
-        payload_hash text
-      );
-    `);
-    await pool.query(`create index if not exists idx_inbound_dedup_created_at on public.inbound_dedup (created_at desc);`);
-  } catch (err) {
-    metric("DB_DEDUP_INIT_FAIL", { message: err?.message || "unknown" });
-  }
-}
-
-async function cleanupInboundDedup() {
-  if (!DB_DEDUP_ENABLED) return;
-  try {
-    await pool.query(`delete from public.inbound_dedup where created_at < now() - interval '2 days';`);
-  } catch (_) {}
-}
-
-async function dbDedupTryInsert({ key, phone, messageSid, payloadHash }) {
-  if (!DB_DEDUP_ENABLED) return { ok: true, inserted: true, skipped: false };
-  try {
-    const r = await pool.query(
-      `
-      insert into public.inbound_dedup (k, phone, message_sid, payload_hash)
-      values ($1, $2, $3, $4)
-      on conflict (k) do nothing
-      returning k
-      `,
-      [key, phone || null, messageSid || null, payloadHash || null]
-    );
-    const inserted = (r.rows || []).length > 0;
-    return { ok: true, inserted, skipped: !inserted };
-  } catch (err) {
-    metric("DB_DEDUP_INSERT_FAIL", { message: err?.message || "unknown" });
-    return { ok: false, inserted: true, skipped: false };
-  }
-}
-
-ensureInboundDedupTable().then(() => cleanupInboundDedup());
-
-// -------------------------
-// Validación firma Twilio
-// -------------------------
-function getPublicUrlForTwilio(req) {
-  const proto =
-    (req.headers["x-forwarded-proto"] && String(req.headers["x-forwarded-proto"]).split(",")[0].trim()) ||
-    req.protocol ||
-    "https";
-  const host = req.headers["x-forwarded-host"] || req.headers["host"];
-  const base = `${proto}://${host}`;
-  return base + req.originalUrl.split("?")[0];
-}
-
-function validateTwilioSignature(req) {
-  if (!TWILIO_VALIDATE_SIGNATURE) {
-    metric("TWILIO_SIG_SKIPPED", { reason: "disabled_env" });
-    return true;
-  }
-  if (!TWILIO_AUTH_TOKEN) {
-    metric("TWILIO_SIG_SKIPPED", { reason: "missing_auth_token" });
-    return true;
-  }
-
-  const sig = req.headers["x-twilio-signature"];
-  if (!sig) {
-    metric("TWILIO_SIG_FAIL", { reason: "missing_signature" });
-    return false;
-  }
-
-  const url = getPublicUrlForTwilio(req);
-  const params = req.body || {};
-
-  try {
-    const ok = twilio.validateRequest(TWILIO_AUTH_TOKEN, String(sig), url, params);
-    if (!ok) metric("TWILIO_SIG_FAIL", { reason: "invalid_signature", url });
-    else metric("TWILIO_SIG_OK", { url });
-    return ok;
-  } catch (e) {
-    metric("TWILIO_SIG_ERROR", { message: e?.message || "unknown" });
-    return false;
-  }
 }
 
 // -------------------------
@@ -850,7 +535,7 @@ function isPro(user) {
     return periodOk || proUntilOk;
   }
 
-  return proUntilOk || plan === "pro";
+  return true;
 }
 
 async function ensureDailyCounter(user) {
@@ -901,7 +586,7 @@ function respond(twiml, text, { appendLowActions } = {}) {
 }
 
 // -------------------------
-// Local parser/router
+// Local router (hard commands + regex)
 // -------------------------
 function localParseSavePhone(body) {
   const t = normalizeText(body);
@@ -978,25 +663,19 @@ function localParseReport(body) {
   return null;
 }
 
-function localParseLegal(body) {
-  const t = normalizeText(body).toLowerCase();
-  if (t === "privacidad" || t === "privacy") return { intent: "privacy" };
-  if (t === "terminos" || t === "términos" || t === "terms") return { intent: "terms" };
-  return null;
-}
 
-function localParseOpt(body) {
-  const t = normalizeText(body);
-  if (isOptOutCommand(t)) return { intent: "opt_out" };
-  if (isOptInCommand(t)) return { intent: "opt_in" };
-  return null;
-}
-
-function localParseAdminKpis(body) {
+function localParseDeleteAccount(body) {
   const t = normalizeText(body).toLowerCase();
-  if (t === "kpis hoy") return { intent: "admin_kpis_today" };
-  if (t === "usuarios hoy") return { intent: "admin_users_today" };
-  if (t === "pro activos") return { intent: "admin_pro_active" };
+  if (
+    t === "borrar mi cuenta" ||
+    t === "borrar cuenta" ||
+    t === "eliminar mi cuenta" ||
+    t === "eliminar cuenta" ||
+    t === "borra mi cuenta" ||
+    t === "borra cuenta"
+  ) {
+    return { intent: "delete_account_start" };
+  }
   return null;
 }
 
@@ -1009,10 +688,8 @@ function localParseAdminTickets(body) {
 
 function localRouter(body) {
   return (
-    localParseAdminKpis(body) ||
     localParseAdminTickets(body) ||
-    localParseOpt(body) ||
-    localParseLegal(body) ||
+    localParseDeleteAccount(body) ||
     localParseReport(body) ||
     localParseSavePhone(body) ||
     localParseMarkPaid(body) ||
@@ -1028,22 +705,9 @@ function localRouter(body) {
 }
 
 // -------------------------
-// Routes (HTTP)
+// Routes (health + stripe success/cancel)
 // -------------------------
-app.get("/health", (_, res) =>
-  res.send(
-    `ok ${VERSION} | PROD_MODE=${PROD_MODE} | KILL_SWITCH=${KILL_SWITCH} | BILLING_DISABLED=${BILLING_DISABLED}`
-  )
-);
-
-app.get("/terms", (_, res) => {
-  res.type("text/plain").send(LEGAL.terms.replace(/\*/g, ""));
-});
-
-app.get("/privacy", (_, res) => {
-  res.type("text/plain").send(LEGAL.privacy.replace(/\*/g, ""));
-});
-
+app.get("/health", (_, res) => res.send(`ok ${VERSION}`));
 app.get("/stripe/success", (_, res) => res.status(200).send("Pago recibido. Ya puedes volver a WhatsApp."));
 app.get("/stripe/cancel", (_, res) => res.status(200).send("Pago cancelado. Puedes volver a WhatsApp y escribir PAGAR cuando gustes."));
 
@@ -1082,7 +746,6 @@ async function markStripeEventProcessed(eventId) {
 }
 
 app.post("/webhook/stripe", async (req, res) => {
-  if (BILLING_DISABLED) return res.status(503).send("Billing disabled");
   if (!stripeReady()) return res.status(500).send("Stripe not configured");
 
   const sig = req.headers["stripe-signature"];
@@ -1097,7 +760,7 @@ app.post("/webhook/stripe", async (req, res) => {
 
   const isNewEvent = await acquireStripeEventLock(event);
   if (!isNewEvent) {
-    if (!PROD_MODE) console.log("⚠️ Stripe duplicate event ignored:", event.id, event.type);
+    console.log("⚠️ Stripe duplicate event ignored:", event.id, event.type);
     return res.json({ received: true, deduped: true });
   }
 
@@ -1113,6 +776,14 @@ app.post("/webhook/stripe", async (req, res) => {
     } catch (_) {
       return null;
     }
+  };
+
+  const sendWhatsApp = async (to, text) => {
+    if (!to || !process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN) return false;
+    const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    const fromWa = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+    await twilioClient.messages.create({ from: fromWa, to, body: text });
+    return true;
   };
 
   try {
@@ -1154,7 +825,7 @@ app.post("/webhook/stripe", async (req, res) => {
         });
 
         metric("PRO_ACTIVATED_FROM_STRIPE", { phone, user_id: userId, cycle });
-        await sendWhatsAppOut(phone, COPY.payConfirmed);
+        await sendWhatsApp(phone, COPY.payConfirmed);
       }
 
       await markStripeEventProcessed(event.id);
@@ -1209,7 +880,7 @@ app.post("/webhook/stripe", async (req, res) => {
       const phone = phoneFromSubscription(sub);
       if (phone) {
         metric("STRIPE_PAYMENT_FAILED", { phone, subscriptionId });
-        await sendWhatsAppOut(phone, COPY.payFailed);
+        await sendWhatsApp(phone, COPY.payFailed);
       }
 
       await markStripeEventProcessed(event.id);
@@ -1256,7 +927,7 @@ app.post("/webhook/stripe", async (req, res) => {
         });
 
         metric("STRIPE_SUB_DELETED", { phone, subscriptionId });
-        await sendWhatsAppOut(phone, COPY.proEnded);
+        await sendWhatsApp(phone, COPY.proEnded);
       }
 
       await markStripeEventProcessed(event.id);
@@ -1276,11 +947,8 @@ app.post("/webhook/stripe", async (req, res) => {
 // WhatsApp webhook
 // -------------------------
 app.post("/webhook/whatsapp", async (req, res) => {
+  const startedAt = Date.now();
   const reqId = makeReqId();
-
-  if (!validateTwilioSignature(req)) {
-    return res.status(403).send("Forbidden");
-  }
 
   const MessagingResponse = twilio.twiml.MessagingResponse;
   const twimlResp = new MessagingResponse();
@@ -1288,73 +956,13 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const from = req.body.From;
   const bodyRaw = req.body.Body || "";
   const body = String(bodyRaw).trim();
-  const messageSid = req.body.MessageSid || null;
 
-  // ✅ Kill switch: responde mantenimiento (pero deja pasar a admins)
-  const admin = isAdminPhone(from);
-  if (KILL_SWITCH && !admin) {
-    metric("KILL_SWITCH_BLOCK", { reqId, from });
-    twimlResp.message(COPY.maintenance);
-    return res.type("text/xml").send(twimlResp.toString());
-  }
-
-  // Opt-out: si está dado de baja, solo permitir ALTA
-  try {
-    if (from) {
-      const opted = await isOptedOut(from);
-      if (opted && !isOptInCommand(body)) {
-        metric("OPTOUT_BLOCKED", { reqId, from });
-        return res.type("text/xml").send(twimlResp.toString());
-      }
-    }
-  } catch (_) {}
-
-  // Dedup + rate limit
-  try {
-    if (messageSid) {
-      const keySid = `sid:${messageSid}`;
-      const rSid = await dbDedupTryInsert({ key: keySid, phone: from, messageSid, payloadHash: null });
-      if (rSid.skipped) {
-        metric("DEDUP_SKIPPED", { reqId, from, reason: "db_message_sid", messageSid });
-        return res.type("text/xml").send(twimlResp.toString());
-      }
-    }
-
-    const payloadHash = sha1(`${String(from || "")}|${String(body || "")}`);
-    const keyHash = `hash:${payloadHash}`;
-    const rHash = await dbDedupTryInsert({ key: keyHash, phone: from, messageSid: messageSid || null, payloadHash });
-    if (rHash.skipped) {
-      metric("DEDUP_SKIPPED", { reqId, from, reason: "db_payload_hash", payloadHash });
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-
-    if (messageSid) {
-      if (dedupMessageSid.has(messageSid)) {
-        metric("DEDUP_SKIPPED", { reqId, from, reason: "mem_message_sid", messageSid });
-        return res.type("text/xml").send(twimlResp.toString());
-      }
-      dedupMessageSid.set(messageSid, DEDUP_SID_TTL_MS);
-    }
-
-    if (dedupPayloadHash.has(payloadHash)) {
-      metric("DEDUP_SKIPPED", { reqId, from, reason: "mem_payload_hash", payloadHash });
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-    dedupPayloadHash.set(payloadHash, DEDUP_BODY_TTL_MS);
-
-    if (from && isRateLimited(from)) {
-      metric("RATE_LIMIT", { reqId, from, window_ms: RL_WINDOW_MS, max: RL_MAX_MSGS });
-      twimlResp.message(COPY.rateLimited);
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-  } catch (e) {
-    metric("DEDUP_FAIL_OPEN", { reqId, message: e?.message || "unknown" });
-  }
-
-  logEvent("INCOMING", { reqId, from, body });
+  logEvent("INCOMING", { ts: isoNow(), reqId, from, body });
 
   try {
     const phone = from;
+    const admin = isAdminPhone(phone);
+
     let user = await getOrCreateUser(phone);
 
     metric("USER_ACTIVE", { reqId, day: dayKey(), user_id: user.id, phone });
@@ -1363,28 +971,16 @@ app.post("/webhook/whatsapp", async (req, res) => {
     // Onboarding
     if (!user.seen_onboarding) {
       await updateUser(phone, { seen_onboarding: true });
-      twimlResp.message(COPY.onboarding);
+      respond(twimlResp, COPY.onboarding);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Opt-out commands
-    if (isOptOutCommand(body)) {
-      await optOut(phone, "user_request");
-      metric("OPTOUT_SET", { reqId, phone });
-      twimlResp.message(COPY.optOutOk);
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-    if (isOptInCommand(body)) {
-      await optIn(phone);
-      metric("OPTOUT_REMOVED", { reqId, phone });
-      twimlResp.message("✅ Listo. Te reactivé FlowSense.\n\nEscribe AYUDA para ver comandos.");
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-
-    // Cancel
+    // Cancel in any state
     if (isNo(body)) {
       await safeResetPending(phone);
-      twimlResp.message("Cancelado ✅");
+      respond(twimlResp, "Cancelado ✅");
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
@@ -1392,7 +988,8 @@ app.post("/webhook/whatsapp", async (req, res) => {
     if (user.pending_action === "support_collect") {
       const msg = normalizeText(body);
       if (!msg) {
-        twimlResp.message(COPY.supportAsk);
+        respond(twimlResp, COPY.supportAsk);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
@@ -1403,42 +1000,40 @@ app.post("/webhook/whatsapp", async (req, res) => {
       metric("SUPPORT_TICKET_CREATED", { reqId, user_id: user.id });
 
       await safeResetPending(phone);
-      twimlResp.message(COPY.supportThanks);
+      respond(twimlResp, COPY.supportThanks);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pending: pro ask name -> activate trial
-    if (user.pending_action === "pro_ask_name") {
-      if (looksLikeNewCommand(body)) {
-        await safeResetPending(phone);
-      } else {
-        const businessName = normalizeText(body).slice(0, 60);
 
-        if (isPro(user)) {
-          await safeResetPending(phone);
-          twimlResp.message(COPY.alreadyPro);
-          return res.type("text/xml").send(twimlResp.toString());
-        }
-
-        const days = TRIAL_DAYS_DEFAULT || 7;
-        const proUntilISO = addDaysISO(days);
-
-        await updateUser(phone, {
-          plan: "pro",
-          pro_source: "trial",
-          pro_until: proUntilISO,
-          pending_action: null,
-          pending_payload: null,
-        });
-
-        metric("PRO_TRIAL_ACTIVATED", { reqId, user_id: user.id, phone, days, pro_until: proUntilISO });
-
-        twimlResp.message(COPY.proTrialActivated(days, proUntilISO, businessName));
-        return res.type("text/xml").send(twimlResp.toString());
-      }
+// Pending: delete account confirm
+if (user.pending_action === "delete_confirm") {
+  if (isDeleteConfirm(body)) {
+    try {
+      await deleteUserAccount(user.id, phone);
+      metric("ACCOUNT_DELETED", { reqId, user_id: user.id });
+      respond(twimlResp, COPY.deleteDone);
+    } catch (err) {
+      metric("ACCOUNT_DELETE_FAIL", { reqId, user_id: user.id, message: err?.message || "unknown" });
+      respond(twimlResp, "⚠️ No pude borrar tu cuenta por el momento. Intenta más tarde o escribe REPORTAR.");
     }
+    // No need to reset pending; user row may be deleted, but keep it safe
+    try {
+      await safeResetPending(phone);
+    } catch (_) {}
+    metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+    return res.type("text/xml").send(twimlResp.toString());
+  }
 
+  // Not confirmed yet
+  respond(twimlResp, COPY.deleteStart);
+  metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+  return res.type("text/xml").send(twimlResp.toString());
+}
+
+    // -------------------------
     // Intent parse: hard-guard PAGAR -> local -> OpenAI
+    // -------------------------
     let parsed = null;
     if (normalizeText(body).toLowerCase() === "pagar") {
       parsed = { intent: "pay" };
@@ -1452,154 +1047,127 @@ app.post("/webhook/whatsapp", async (req, res) => {
       }
     }
 
-    // Legal
-    if (parsed.intent === "privacy") {
-      twimlResp.message(LEGAL.privacy);
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-    if (parsed.intent === "terms") {
-      twimlResp.message(LEGAL.terms);
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-
-    // Admin KPIs
-    if (parsed.intent === "admin_kpis_today") {
-      if (!admin) {
-        twimlResp.message("No autorizado.");
-        return res.type("text/xml").send(twimlResp.toString());
-      }
-      const k = await getKpisToday();
-      const proCnt = await getProActiveCount();
-      twimlResp.message(
-        `📊 *KPIs HOY* (${k.day})\n\n` +
-          `• Usuarios activos: ${k.users}\n` +
-          `• Mensajes: ${k.messages}\n` +
-          `• Billable: ${k.billable}\n` +
-          `• Unknown: ${k.unknown}\n` +
-          `• Pro activos: ${proCnt}\n\n` +
-          `PROD_MODE=${PROD_MODE} | KILL_SWITCH=${KILL_SWITCH} | BILLING_DISABLED=${BILLING_DISABLED}`
-      );
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-
-    if (parsed.intent === "admin_users_today") {
-      if (!admin) {
-        twimlResp.message("No autorizado.");
-        return res.type("text/xml").send(twimlResp.toString());
-      }
-      const k = await getKpisToday();
-      twimlResp.message(`👥 *USUARIOS HOY* (${k.day}): ${k.users}`);
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-
-    if (parsed.intent === "admin_pro_active") {
-      if (!admin) {
-        twimlResp.message("No autorizado.");
-        return res.type("text/xml").send(twimlResp.toString());
-      }
-      const proCnt = await getProActiveCount();
-      twimlResp.message(`🚀 *PRO ACTIVOS*: ${proCnt}`);
-      return res.type("text/xml").send(twimlResp.toString());
-    }
-
-    // Admin tickets
+    // Admin commands
     if (parsed.intent === "admin_tickets_today") {
       if (!admin) {
-        twimlResp.message("No autorizado.");
+        respond(twimlResp, "No autorizado.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
       const rows = await getTicketsToday(10);
-      if (!rows.length) twimlResp.message("✅ No hay tickets hoy.");
-      else {
+      if (!rows.length) {
+        respond(twimlResp, "✅ No hay tickets hoy.");
+      } else {
         const lines = rows.map((t) => {
           const hhmm = new Date(t.created_at).toISOString().slice(11, 16);
           return `#${t.id} ${hhmm} ${t.phone}\n${String(t.message).slice(0, 120)}`;
         });
-        twimlResp.message(`🛠️ Tickets HOY (${rows.length}):\n\n` + lines.join("\n\n"));
+        respond(twimlResp, `🛠️ Tickets HOY (${rows.length}):\n\n` + lines.join("\n\n"));
       }
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
     if (parsed.intent === "admin_tickets_open") {
       if (!admin) {
-        twimlResp.message("No autorizado.");
+        respond(twimlResp, "No autorizado.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
       const rows = await getTicketsOpen(10);
-      if (!rows.length) twimlResp.message("✅ No hay tickets abiertos.");
-      else {
+      if (!rows.length) {
+        respond(twimlResp, "✅ No hay tickets abiertos.");
+      } else {
         const lines = rows.map((t) => {
           const d = new Date(t.created_at).toISOString().slice(0, 10);
           return `#${t.id} ${d} ${t.phone}\n${String(t.message).slice(0, 120)}`;
         });
-        twimlResp.message(`🛠️ Tickets ABIERTOS (${rows.length}):\n\n` + lines.join("\n\n"));
+        respond(twimlResp, `🛠️ Tickets ABIERTOS (${rows.length}):\n\n` + lines.join("\n\n"));
       }
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Support
+    // Support start
     if (parsed.intent === "support_start") {
       await updateUser(phone, {
         pending_action: "support_collect",
         pending_payload: { last_intent: user.last_intent || null },
       });
-      twimlResp.message(COPY.supportAsk);
+      metric("SUPPORT_FLOW_STARTED", { reqId, user_id: user.id });
+      respond(twimlResp, COPY.supportAsk);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
+    // Support inline: "REPORTAR algo..."
     if (parsed.intent === "support_inline") {
       const msg = normalizeText(parsed.message || "");
       if (!msg) {
         await updateUser(phone, { pending_action: "support_collect", pending_payload: { last_intent: user.last_intent || null } });
-        twimlResp.message(COPY.supportAsk);
+        respond(twimlResp, COPY.supportAsk);
       } else {
         await createSupportTicket({ userId: user.id, phone: user.phone, message: msg.slice(0, 1200), lastIntent: user.last_intent || null });
         metric("SUPPORT_TICKET_CREATED", { reqId, user_id: user.id, inline: true });
-        twimlResp.message(COPY.supportThanks);
+        respond(twimlResp, COPY.supportThanks);
       }
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pricing
+    // Quick commands
+// Delete account start
+if (parsed.intent === "delete_account_start") {
+  await updateUser(phone, { pending_action: "delete_confirm", pending_payload: { started_at: isoNow() } });
+  metric("ACCOUNT_DELETE_STARTED", { reqId, user_id: user.id });
+  respond(twimlResp, COPY.deleteStart);
+  metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+  return res.type("text/xml").send(twimlResp.toString());
+}
+
     if (parsed.intent === "pricing") {
-      twimlResp.message(COPY.pricing);
+      respond(twimlResp, COPY.pricing);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Want Pro (trial)
     if (parsed.intent === "want_pro") {
-      if (isPro(user)) {
-        twimlResp.message(COPY.alreadyPro);
-        return res.type("text/xml").send(twimlResp.toString());
-      }
       await updateUser(phone, { pending_action: "pro_ask_name", pending_payload: { started_at: isoNow() } });
       metric("PRO_INTEREST", { reqId, user_id: user.id });
-      twimlResp.message(COPY.wantProAskName);
+
+      respond(twimlResp, COPY.wantProAskName);
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Pay
     if (parsed.intent === "pay") {
-      if (BILLING_DISABLED) {
-        twimlResp.message("⚠️ Cobros temporalmente desactivados.\n\nEscribe QUIERO PRO para prueba gratis o intenta más tarde.");
-        return res.type("text/xml").send(twimlResp.toString());
-      }
       if (!stripeReady()) {
-        twimlResp.message("⚠️ Pagos no configurados todavía. Revisa variables STRIPE_* en Render (Web Service).");
+        metric("PAY_NOT_CONFIGURED", { reqId, user_id: user.id });
+        respond(twimlResp, "⚠️ Pagos no configurados todavía. Revisa variables STRIPE_* en Render (Web Service).");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
+
       const cycle = user.pro_lead_cycle || "mensual";
       const session = await createCheckoutSessionForUser(user, cycle);
+
       await updateUser(phone, { pro_lead_status: "payment_link_sent" });
-      twimlResp.message(COPY.payLink(session.url));
+      metric("PAY_LINK_CREATED", { reqId, user_id: user.id, cycle });
+
+      respond(twimlResp, COPY.payLink(session.url));
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
-    // Paywall
+    // Paywall for billable intents
     const gate = await enforcePaywallIfNeeded({ user, reqId, intent: parsed.intent, twiml: twimlResp });
     user = gate.user;
     const appendLowActions = Boolean(gate.lowActionsWarning);
-    if (gate.blocked) return res.type("text/xml").send(twimlResp.toString());
+
+    if (gate.blocked) {
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
+      return res.type("text/xml").send(twimlResp.toString());
+    }
 
     // SAVE PHONE
     if (parsed.intent === "save_phone") {
@@ -1607,27 +1175,32 @@ app.post("/webhook/whatsapp", async (req, res) => {
       const normalized = normalizePhoneToWhatsApp(parsed.phone);
 
       if (!clientName || !normalized) {
-        twimlResp.message(`Ejemplo:\n"Guarda teléfono de Pepe +5218331112222"`);
+        respond(twimlResp, `Ejemplo:\n"Guarda teléfono de Pepe +5218331112222"`);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
       await upsertClient(user.id, clientName);
       await setClientPhone(user.id, clientName, normalized);
 
+      metric("PHONE_SAVED", { reqId, user_id: user.id, client: clientName });
       respond(
         twimlResp,
         `✅ Guardado.\n• Cliente: ${clientName}\n• Tel: ${normalized.replace("whatsapp:", "")}`,
         { appendLowActions }
       );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
     // LIST DEBTS
     if (parsed.intent === "list_debts") {
       const debts = await listPendingDebts(user.id);
+      metric("DEBTS_LISTED", { reqId, user_id: user.id, count: debts.length });
 
       if (!debts.length) {
-        twimlResp.message("✅ No tienes deudas registradas por cobrar.");
+        respond(twimlResp, "✅ No tienes deudas registradas por cobrar.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
@@ -1637,7 +1210,8 @@ app.post("/webhook/whatsapp", async (req, res) => {
         return `${i + 1}) ${d.client_name}: ${amt}${since}`;
       });
 
-      twimlResp.message("📌 Te deben:\n" + lines.join("\n"));
+      respond(twimlResp, "📌 Te deben:\n" + lines.join("\n"));
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
@@ -1647,13 +1221,17 @@ app.post("/webhook/whatsapp", async (req, res) => {
       const amount = parsed.amount_due;
 
       if (!amount) {
-        twimlResp.message(`No pude identificar el monto. Ejemplo: "Pepe me debe 9500 desde agosto"`);
+        respond(twimlResp, `No pude identificar el monto. Ejemplo: "Pepe me debe 9500 desde agosto"`);
+        metric("DEBT_AMOUNT_MISSING", { reqId, user_id: user.id, client: clientName });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
       const since = parsed.since_text || null;
       await upsertClient(user.id, clientName);
       const debt = await addDebt(user.id, clientName, amount, since);
+
+      metric("DEBT_CREATED", { reqId, user_id: user.id, client: clientName, amount_due: Number(amount) });
 
       const amt = Number(debt.amount_due).toLocaleString("es-MX", { style: "currency", currency: "MXN" });
       respond(
@@ -1663,15 +1241,18 @@ app.post("/webhook/whatsapp", async (req, res) => {
           `\n¿Quieres agregar otro o preguntar "¿Quién me debe?"`,
         { appendLowActions }
       );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
     // PRIORITIZE
     if (parsed.intent === "prioritize") {
       const debts = await listPendingDebts(user.id);
+      metric("PRIORITIZE_USED", { reqId, user_id: user.id, pending_count: debts.length });
 
       if (!debts.length) {
-        twimlResp.message("✅ No tienes deudas registradas por cobrar.");
+        respond(twimlResp, "✅ No tienes deudas registradas por cobrar.");
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
@@ -1691,9 +1272,11 @@ app.post("/webhook/whatsapp", async (req, res) => {
         `📌 *Recomendación de cobranza*\n\n` +
           `Cobra primero a *${top.client_name}* por *${amt}*` +
           (top.due_text ? ` (desde ${top.due_text})` : "") +
-          `.`,
+          `.\n` +
+          (top.days ? `Prioridad por atraso estimado: ~${top.days} días.` : ""),
         { appendLowActions }
       );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
@@ -1701,17 +1284,23 @@ app.post("/webhook/whatsapp", async (req, res) => {
     if (parsed.intent === "mark_paid") {
       const clientName = parsed.client_name;
       if (!clientName) {
-        twimlResp.message(`¿De quién? Ejemplo: "Ya pagó Pepe"`);
+        respond(twimlResp, `¿De quién? Ejemplo: "Ya pagó Pepe"`);
+        metric("PAID_MISSING_CLIENT", { reqId, user_id: user.id });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
       const r = await markLatestDebtPaid(user.id, clientName);
       if (!r) {
-        twimlResp.message(`No encontré deudas pendientes de *${clientName}*.`);
+        metric("DEBT_PAID_NOT_FOUND", { reqId, user_id: user.id, client: clientName });
+        respond(twimlResp, `No encontré deudas pendientes de *${clientName}*.`);
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
+      metric("DEBT_MARKED_PAID", { reqId, user_id: user.id, client: clientName });
       respond(twimlResp, `✅ Marcado como pagado: *${clientName}*`, { appendLowActions });
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
@@ -1719,7 +1308,9 @@ app.post("/webhook/whatsapp", async (req, res) => {
     if (parsed.intent === "remind") {
       const clientName = parsed.client_name || null;
       if (!clientName) {
-        twimlResp.message(`¿A quién le mando recordatorio? Ejemplo: "Manda recordatorio a Pepe"`);
+        respond(twimlResp, `¿A quién le mando recordatorio? Ejemplo: "Manda recordatorio a Pepe"`);
+        metric("REMINDER_MISSING_CLIENT", { reqId, user_id: user.id });
+        metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
         return res.type("text/xml").send(twimlResp.toString());
       }
 
@@ -1732,22 +1323,29 @@ app.post("/webhook/whatsapp", async (req, res) => {
         pending_payload: { clientName, amount: null, toPhone },
       });
 
+      metric("REMINDER_FLOW_STARTED", { reqId, user_id: user.id, client: clientName, has_client_phone: Boolean(toPhone) });
+
       respond(
         twimlResp,
         `¿Qué tono quieres para el recordatorio a *${clientName}*?\n• amable\n• firme\n• urgente\n\n(O escribe "cancelar")`,
         { appendLowActions }
       );
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
     // HELP
     if (parsed.intent === "help") {
-      twimlResp.message(COPY.help);
+      respond(twimlResp, COPY.help);
+      metric("HELP_USED", { reqId, user_id: user.id });
+      metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
       return res.type("text/xml").send(twimlResp.toString());
     }
 
     // fallback
-    twimlResp.message(
+    metric("FALLBACK_DEFAULT", { reqId, user_id: user.id });
+    respond(
+      twimlResp,
       `Te leo. Prueba:\n` +
         `• "Pepe me debe 9500 desde agosto"\n` +
         `• "¿Quién me debe?"\n` +
@@ -1756,21 +1354,17 @@ app.post("/webhook/whatsapp", async (req, res) => {
         `• "Manda recordatorio a Pepe"\n` +
         `• AYUDA\n` +
         `• PRECIO\n` +
-        `• QUIERO PRO\n` +
         `• PAGAR\n` +
-        `• REPORTAR\n` +
-        `• PRIVACIDAD\n` +
-        `• TERMINOS\n` +
-        `• BAJA / STOP`
+        `• REPORTAR`
     );
+    metric("RESPONSE_SENT", { reqId, user_id: user.id, ms: Date.now() - startedAt });
     return res.type("text/xml").send(twimlResp.toString());
   } catch (err) {
     console.error("❌ Webhook error:", err);
     metric("ERROR", { reqId, stage: "webhook_catch", message: err?.message || "unknown" });
     twimlResp.message("⚠️ Hubo un problema temporal. Intenta de nuevo en un momento.");
+    metric("RESPONSE_SENT", { reqId, ms: Date.now() - startedAt });
     return res.type("text/xml").send(twimlResp.toString());
-  } finally {
-    if (Math.random() < 0.02) cleanupInboundDedup().catch(() => {});
   }
 });
 
