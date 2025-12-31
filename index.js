@@ -1,11 +1,12 @@
 // index.js — FlowSense (WhatsApp-first cobranza) + Stripe + Paywall + Observability + Support Tickets
-// v-2025-12-30-COPYS-UX-SUPPORT
+// v-2025-12-31-BLOQUE3-RATE-LIMIT-DEDUP
 
 require("dotenv").config();
 
 const express = require("express");
 const twilio = require("twilio");
 const Stripe = require("stripe");
+const crypto = require("crypto");
 
 const { parseMessage } = require("./ai");
 const {
@@ -21,7 +22,7 @@ const {
 } = require("./db");
 
 const app = express();
-const VERSION = "v-2025-12-30-COPYS-UX-SUPPORT";
+const VERSION = "v-2025-12-31-BLOQUE3-RATE-LIMIT-DEDUP";
 
 // -------------------------
 // Admin controls
@@ -236,6 +237,11 @@ const COPY = {
   supportThanks:
     `✅ Gracias. Ya registré tu reporte.\n` +
     `Lo revisaré y te aviso aquí mismo. 🙌`,
+
+  rateLimited:
+    `🕒 Voy un poco saturado con tantos mensajes seguidos.\n` +
+    `Dame *unos segundos* y vuelve a intentar.\n\n` +
+    `Tip: manda *un solo mensaje* con toda la info (cliente + monto + fecha).`,
 };
 
 // -------------------------
@@ -441,6 +447,71 @@ async function safeResetPending(phone) {
     await updateUser(phone, { pending_action: null, pending_payload: null });
   } catch (_) {}
 }
+
+// -------------------------
+// Bloque 3 — Anti-spam + Anti-replay + Anti-loops
+// -------------------------
+class TTLMap {
+  constructor() {
+    this.map = new Map();
+  }
+  set(key, ttlMs) {
+    this.map.set(key, Date.now() + ttlMs);
+  }
+  has(key) {
+    const exp = this.map.get(key);
+    if (!exp) return false;
+    if (Date.now() > exp) {
+      this.map.delete(key);
+      return false;
+    }
+    return true;
+  }
+  cleanup() {
+    const now = Date.now();
+    for (const [k, exp] of this.map.entries()) {
+      if (now > exp) this.map.delete(k);
+    }
+  }
+}
+
+function sha1(input) {
+  return crypto.createHash("sha1").update(String(input)).digest("hex");
+}
+
+// Dedup TTLs
+const DEDUP_SID_TTL_MS = 10 * 60 * 1000; // 10 min para MessageSid (seguro)
+const DEDUP_BODY_TTL_MS = 15 * 1000;     // 15s para mismo from+body (anti-retry/loop)
+
+// Dedup stores (memoria del proceso)
+const dedupMessageSid = new TTLMap();
+const dedupPayloadHash = new TTLMap();
+
+// Rate limit config
+const RL_WINDOW_MS = 15 * 1000; // 15s
+const RL_MAX_MSGS = 6;          // 6 msgs en 15s
+const rlState = new Map();      // phone -> [timestamps]
+
+function isRateLimited(phone) {
+  const now = Date.now();
+  const arr = rlState.get(phone) || [];
+  const fresh = arr.filter((t) => now - t < RL_WINDOW_MS);
+  fresh.push(now);
+  rlState.set(phone, fresh);
+  return fresh.length > RL_MAX_MSGS;
+}
+
+setInterval(() => {
+  dedupMessageSid.cleanup();
+  dedupPayloadHash.cleanup();
+  // rate limit cleanup simple
+  const now = Date.now();
+  for (const [k, arr] of rlState.entries()) {
+    const fresh = arr.filter((t) => now - t < RL_WINDOW_MS);
+    if (!fresh.length) rlState.delete(k);
+    else rlState.set(k, fresh);
+  }
+}, 30 * 1000).unref();
 
 // -------------------------
 // Paywall + Pro logic
@@ -887,6 +958,37 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const from = req.body.From;
   const bodyRaw = req.body.Body || "";
   const body = String(bodyRaw).trim();
+  const messageSid = req.body.MessageSid || null;
+
+  // --- Bloque 3: anti-replay + anti-loop (antes de todo)
+  try {
+    // Dedup por MessageSid (Twilio)
+    if (messageSid) {
+      if (dedupMessageSid.has(messageSid)) {
+        metric("DEDUP_SKIPPED", { reqId, from, reason: "message_sid", messageSid });
+        return res.type("text/xml").send(twimlResp.toString()); // <Response/>
+      }
+      dedupMessageSid.set(messageSid, DEDUP_SID_TTL_MS);
+    }
+
+    // Dedup por hash from+body (ventana corta)
+    const payloadKey = sha1(`${String(from || "")}|${String(body || "")}`);
+    if (dedupPayloadHash.has(payloadKey)) {
+      metric("DEDUP_SKIPPED", { reqId, from, reason: "payload_hash", payloadKey });
+      return res.type("text/xml").send(twimlResp.toString()); // <Response/>
+    }
+    dedupPayloadHash.set(payloadKey, DEDUP_BODY_TTL_MS);
+
+    // Rate limit anti-spam
+    if (from && isRateLimited(from)) {
+      metric("RATE_LIMIT", { reqId, from, window_ms: RL_WINDOW_MS, max: RL_MAX_MSGS });
+      twimlResp.message(COPY.rateLimited);
+      return res.type("text/xml").send(twimlResp.toString());
+    }
+  } catch (e) {
+    // Si algo falla en dedup/rate-limit, NO rompemos el flujo.
+    metric("BLOQUE3_FAIL_OPEN", { reqId, message: e?.message || "unknown" });
+  }
 
   logEvent("INCOMING", { ts: isoNow(), reqId, from, body });
 
